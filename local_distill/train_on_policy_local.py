@@ -18,6 +18,11 @@ from transformers import (
 )
 from accelerate import Accelerator
 try:
+    from tqdm.auto import tqdm  # type: ignore
+    _HAVE_TQDM = True
+except Exception:
+    _HAVE_TQDM = False
+try:
     import deepspeed  # type: ignore
     DEEPSPEED_AVAILABLE = True
 except Exception:
@@ -65,6 +70,8 @@ class Config:
     # Micro-batching to reduce peak memory on student
     gen_micro_batch: int = 8
     lp_micro_batch: int = 8
+    # Progress bar control
+    progress: bool = True
 
 
 def load_prompts(path: str | None) -> List[str]:
@@ -151,6 +158,7 @@ def generate_continuations(
     temperature: float,
     top_p: float,
     micro_batch: int,
+    show_progress: bool,
 ) -> Tuple[torch.Tensor, List[int]]:
     # unwrap if DDP-wrapped
     model_for_gen = getattr(model, "module", model)
@@ -158,7 +166,11 @@ def generate_continuations(
     outs: List[torch.Tensor] = []
     plens: List[int] = []
     with torch.no_grad():
-        for i in range(0, len(prompts), max(1, micro_batch)):
+        iterator = range(0, len(prompts), max(1, micro_batch))
+        bar = None
+        if show_progress and _HAVE_TQDM:
+            bar = tqdm(total=len(prompts), desc="gen", leave=False, dynamic_ncols=True)
+        for i in iterator:
             chunk = prompts[i : i + max(1, micro_batch)]
             batch = tokenizer(
                 chunk,
@@ -178,6 +190,10 @@ def generate_continuations(
             )
             outs.append(gen)
             plens.extend(batch["input_ids"].ne(tokenizer.pad_token_id).sum(dim=1).tolist())
+            if bar is not None:
+                bar.update(len(chunk))
+        if bar is not None:
+            bar.close()
     return torch.cat(outs, dim=0), plens
 
 
@@ -222,7 +238,10 @@ def train_step(
 ) -> dict:
     # 1) Sample with the student (no grad)
     full_seqs, prompt_lengths = generate_continuations(
-        student, tokenizer, prompts, cfg.max_new_tokens, cfg.temperature, cfg.top_p, cfg.gen_micro_batch
+        student, tokenizer, prompts,
+        cfg.max_new_tokens, cfg.temperature, cfg.top_p,
+        cfg.gen_micro_batch,
+        cfg.progress and accelerator.is_main_process,
     )
 
     attention_mask = full_seqs.ne(tokenizer.pad_token_id).long()
@@ -231,9 +250,17 @@ def train_step(
     teacher.eval()
     with torch.no_grad():
         parts_t: List[torch.Tensor] = []
-        for i in range(0, full_seqs.size(0), max(1, cfg.lp_micro_batch)):
+        iterator_t = range(0, full_seqs.size(0), max(1, cfg.lp_micro_batch))
+        bar_t = None
+        if cfg.progress and _HAVE_TQDM and accelerator.is_main_process:
+            bar_t = tqdm(total=full_seqs.size(0), desc="teacher lp", leave=False, dynamic_ncols=True)
+        for i in iterator_t:
             sl = slice(i, i + max(1, cfg.lp_micro_batch))
             parts_t.append(sequence_logprobs(teacher, full_seqs[sl], attention_mask[sl]))
+            if bar_t is not None:
+                bar_t.update(full_seqs[sl].size(0))
+        if bar_t is not None:
+            bar_t.close()
         teach_lp = torch.cat(parts_t, dim=0)  # [B, T-1]
 
     student.train()
@@ -256,9 +283,17 @@ def train_step(
 
     with ctx:
         parts_s: List[torch.Tensor] = []
-        for i in range(0, full_seqs.size(0), max(1, cfg.lp_micro_batch)):
+        iterator_s = range(0, full_seqs.size(0), max(1, cfg.lp_micro_batch))
+        bar_s = None
+        if cfg.progress and _HAVE_TQDM and accelerator.is_main_process:
+            bar_s = tqdm(total=full_seqs.size(0), desc="student lp", leave=False, dynamic_ncols=True)
+        for i in iterator_s:
             sl = slice(i, i + max(1, cfg.lp_micro_batch))
             parts_s.append(sequence_logprobs(student, full_seqs[sl], attention_mask[sl]))
+            if bar_s is not None:
+                bar_s.update(full_seqs[sl].size(0))
+        if bar_s is not None:
+            bar_s.close()
         stud_lp = torch.cat(parts_s, dim=0)  # [B, T-1]
 
     # Build mask for continuation tokens (exclude prompt tokens)
@@ -421,11 +456,17 @@ def main(cfg: Config) -> None:
             # quick post-KL estimate on a small sample
             with torch.no_grad():
                 eval_prompts = prompts[: min(4, len(prompts))]
-                seqs, plens = generate_continuations(student, tokenizer, eval_prompts, cfg.max_new_tokens, cfg.temperature, cfg.top_p, cfg.gen_micro_batch)
+                seqs, plens = generate_continuations(
+                    student, tokenizer, eval_prompts,
+                    cfg.max_new_tokens, cfg.temperature, cfg.top_p,
+                    cfg.gen_micro_batch,
+                    cfg.progress and accelerator.is_main_process,
+                )
                 am = seqs.ne(tokenizer.pad_token_id).long()
                 # micro-batched logprobs for eval as well
                 s_parts, t_parts = [], []
-                for i in range(0, seqs.size(0), max(1, cfg.lp_micro_batch)):
+                it_eval = range(0, seqs.size(0), max(1, cfg.lp_micro_batch))
+                for i in it_eval:
                     sl = slice(i, i + max(1, cfg.lp_micro_batch))
                     s_parts.append(sequence_logprobs(student, seqs[sl], am[sl]))
                     t_parts.append(sequence_logprobs(teacher, seqs[sl], am[sl]))
@@ -497,6 +538,7 @@ def parse_args() -> Config:
     p.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline", "disabled"])
     p.add_argument("--teacher_ds_zero3", action="store_true", help="使用 DeepSpeed ZeRO-3 对 teacher 做推理分片")
     p.add_argument("--teacher_ds_config", type=str, default=None, help="DeepSpeed 配置文件（可选），未提供则使用内置零三推理配置")
+    p.add_argument("--no_progress", action="store_true", help="关闭进度条显示（默认开启，仅主进程显示）")
     p.add_argument("--gen_micro_batch", type=int, default=8, help="生成阶段微批大小")
     p.add_argument("--lp_micro_batch", type=int, default=8, help="logprob 前向微批大小")
     a = p.parse_args()
@@ -533,6 +575,7 @@ def parse_args() -> Config:
         teacher_ds_config=a.teacher_ds_config,
         gen_micro_batch=a.gen_micro_batch,
         lp_micro_batch=a.lp_micro_batch,
+        progress=not a.no_progress,
     )
 
 

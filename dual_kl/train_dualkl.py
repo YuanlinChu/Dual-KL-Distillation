@@ -159,8 +159,11 @@ def generate_continuations(
     """Generate in micro-batches to cap peak memory."""
     model_for_gen = getattr(model, "module", model)
     model_for_gen.eval()
-    all_out: List[torch.Tensor] = []
+    # 收集原始输出，统一在循环结束后做全局长度对齐
+    all_out_raw: List[torch.Tensor] = []
     all_plen: List[int] = []
+    max_T: int = 0
+    pad_id = tok.pad_token_id if getattr(tok, "pad_token_id", None) is not None else 0
     with torch.no_grad():
         iterator = range(0, len(prompts), max(1, micro_batch))
         bar = None
@@ -176,16 +179,32 @@ def generate_continuations(
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 top_p=top_p,
-                pad_token_id=tok.pad_token_id,
+                pad_token_id=pad_id,
                 eos_token_id=tok.eos_token_id,
             )
-            pl = batch["input_ids"].ne(tok.pad_token_id).sum(dim=1).tolist()
-            all_out.append(gen)
+            # 跟踪全局最大序列长度
+            max_T = max(max_T, gen.size(1))
+            # 记录每个样本的提示长度，用于续写掩码
+            pl = batch["input_ids"].ne(pad_id).sum(dim=1).tolist()
+            all_out_raw.append(gen)
             all_plen.extend(pl)
             if bar is not None:
                 bar.update(len(chunk))
         if bar is not None:
             bar.close()
+
+    # 将所有微批的输出统一右侧填充到全局最大长度，以便拼接
+    def pad_to(t: torch.Tensor, target_len: int, pad_token_id: int) -> torch.Tensor:
+        if t.size(1) == target_len:
+            return t
+        if t.size(1) > target_len:
+            # 理论上不会发生，这里防御性截断
+            return t[:, :target_len]
+        pad_cols = target_len - t.size(1)
+        pad = torch.full((t.size(0), pad_cols), pad_token_id, dtype=t.dtype, device=t.device)
+        return torch.cat([t, pad], dim=1)
+
+    all_out: List[torch.Tensor] = [pad_to(t, max_T, pad_id) for t in all_out_raw]
     return torch.cat(all_out, dim=0), all_plen
 
 
@@ -196,6 +215,7 @@ def logits_and_logprobs(
     micro_batch: int,
     show_progress: bool,
     desc: str,
+    use_cache: bool = True,  # 新增：是否使用 KV 缓存
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute logits/logprobs in micro-batches along batch dimension."""
     outs_l: List[torch.Tensor] = []
@@ -206,7 +226,11 @@ def logits_and_logprobs(
         bar = tqdm(total=input_ids.size(0), desc=desc, leave=False, dynamic_ncols=True)
     for i in iterator:
         sl = slice(i, i + max(1, micro_batch))
-        logits = model(input_ids=input_ids[sl], attention_mask=attention_mask[sl]).logits  # [b,T,V]
+        logits = model(
+            input_ids=input_ids[sl],
+            attention_mask=attention_mask[sl],
+            use_cache=use_cache,  # 训练前向可选择关闭缓存
+        ).logits  # [b,T,V]
         logp = nn.functional.log_softmax(logits, dim=-1)
         outs_l.append(logits)
         outs_lp.append(logp)
@@ -266,6 +290,7 @@ def train_step(student: PreTrainedModel, teacher: PreTrainedModel, tok: PreTrain
             cfg.lp_micro_batch,
             cfg.progress and accelerator.is_main_process,
             desc="teacher lp",
+            # 教师保持默认 use_cache=True
         )
     student.train()
     logit_s_std, logp_s_std = logits_and_logprobs(
@@ -273,6 +298,7 @@ def train_step(student: PreTrainedModel, teacher: PreTrainedModel, tok: PreTrain
         cfg.lp_micro_batch,
         cfg.progress and accelerator.is_main_process,
         desc="student lp",
+        use_cache=False,  # 学生训练前向关闭缓存，降低显存峰值
     )
 
     # 3) 计算 per-position 反向 KL 指标 D_rkl（用于门控）
@@ -307,8 +333,8 @@ def train_step(student: PreTrainedModel, teacher: PreTrainedModel, tok: PreTrain
 
     # FKL：full=全词表期望；argmax=老师 argmax token 的 CE
     if cfg.fkl == "full":
-        # CE = -sum p_T * log p_S；等价于 FKL 去掉常数项 H(p_T)
-        ce_pos = -(logp_t_std.exp() * logp_s_std).sum(dim=-1)  # [B,T-1]
+        # 对齐到 [B, T-1]：截掉最后一位的 next-token 预测，再做 p_T * log p_S 的期望
+        ce_pos = -(logp_t_std[:, :-1, :].exp() * logp_s_std[:, :-1, :]).sum(dim=-1)  # [B,T-1]
         fkl_loss_pos = ce_pos
     elif cfg.fkl == "argmax":
         with torch.no_grad():
@@ -328,15 +354,17 @@ def train_step(student: PreTrainedModel, teacher: PreTrainedModel, tok: PreTrain
 
     # 7) 合成逐位损失并聚合
     loss_pos = lam * rkl_loss_pos + (1.0 - lam) * fkl_loss_pos
-    loss = loss_pos.masked_select(cont_mask).mean()
+    # 仅在有效 token（续写且非 pad）位置聚合
+    valid_mask = cont_mask & am_std[:, 1:].bool()
+    loss = loss_pos.masked_select(valid_mask).mean()
 
     accelerator.backward(loss)
 
     # 指标（跨进程聚合）
-    lam_mean = accelerator.gather_for_metrics(lam.masked_select(cont_mask).detach()).mean().item()
-    d_rkl_mean = accelerator.gather_for_metrics(d_rkl.masked_select(cont_mask).detach()).mean().item()
+    lam_mean = accelerator.gather_for_metrics(lam.masked_select(valid_mask).detach()).mean().item()
+    d_rkl_mean = accelerator.gather_for_metrics(d_rkl.masked_select(valid_mask).detach()).mean().item()
     loss_val = accelerator.gather_for_metrics(loss.detach()).mean().item()
-    tokens = accelerator.gather_for_metrics(cont_mask.sum().detach()).sum().item()
+    tokens = accelerator.gather_for_metrics(valid_mask.sum().detach()).sum().item()
     return {"loss": float(loss_val), "lambda": float(lam_mean), "rkl_metric": float(d_rkl_mean), "tokens": int(tokens)}
 
 
@@ -353,8 +381,8 @@ def main(cfg: Config) -> None:
 
     # 模型与分词器
     torch_dtype = torch.bfloat16 if cfg.dtype.lower() == "bf16" else torch.float16 if cfg.dtype.lower() == "fp16" else None
-    student = AutoModelForCausalLM.from_pretrained(cfg.student_model, torch_dtype=torch_dtype if torch_dtype else None)
-    teacher = AutoModelForCausalLM.from_pretrained(cfg.teacher_model, torch_dtype=torch_dtype if torch_dtype else None)
+    student = AutoModelForCausalLM.from_pretrained(cfg.student_model, dtype=torch_dtype if torch_dtype else None)
+    teacher = AutoModelForCausalLM.from_pretrained(cfg.teacher_model, dtype=torch_dtype if torch_dtype else None)
     tok = AutoTokenizer.from_pretrained(cfg.student_model)
     # decoder-only models prefer left padding for generation efficiency
     try:

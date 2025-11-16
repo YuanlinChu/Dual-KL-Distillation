@@ -10,18 +10,19 @@
 安装
 - pip install torch transformers peft datasets accelerate wandb deepspeed
 
-快速启动（2 卡 A800，bf16）
+快速启动（4 卡 A800，bf16）
 - accelerate launch --config_file local_distill/accelerate_config_multi_gpu.yaml \
-  -m dual_kl.train_dualkl_local \
+  -m dual_kl.train_dualkl \
   --student_model Qwen/Qwen3-4B --teacher_model Qwen/Qwen3-32B \
   --dataset tulu3 --batch_size 256 --group_size 4 --grad_accum 8 \
-  --max_new_tokens 512 --use_lora --lora_r 64 --dtype bf16 \
+  --max_new_tokens 256 --use_lora --lora_r 64 --dtype bf16 \
   --tau 1.0 --alpha 5.0 --gating soft --rkl exact --fkl full \
-  --wandb_project dualkl-distill --wandb_name qwen8b_dualkl \
+  --wandb_project dualkl-distill --wandb_name qwen4b_dualkl \
   --teacher_ds_zero3  # 教师 32B 建议启用 ZeRO-3 推理分片；可选 --teacher_ds_config path/to/ds_zero3_infer.json
-  --gen_micro_batch 4 --lp_micro_batch 8  # 学生生成/前向的微批，避免 OOM
+  --gen_micro_batch 4 --lp_micro_batch 4  # 学生生成/前向的微批，避免 OOM
+  --no_progress  # 如果需要禁用 tqdm 进度条则加上这个参数
 
-参数说明（与 local_distill 对齐的基础上新增）
+参数说明（与 local_distill 对齐的基础上新增
 - 门控与 KL：
   - `--tau`：门控阈值，越小越容易走 forward KL。
   - `--alpha`：门控平滑度（sigmoid 斜率），越大越接近硬门控。
