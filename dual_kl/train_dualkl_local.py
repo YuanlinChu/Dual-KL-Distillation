@@ -62,6 +62,9 @@ class Config:
     # DeepSpeed options for teacher sharding
     teacher_ds_zero3: bool = False
     teacher_ds_config: str | None = None
+    # Micro-batching to reduce peak memory
+    gen_micro_batch: int = 8   # generation micro-batch size
+    lp_micro_batch: int = 8    # logprob micro-batch size for student/teacher
 
 
 def ensure_pad_token(tok: PreTrainedTokenizerBase) -> None:
@@ -136,29 +139,56 @@ def truncate_by_tokens(tok: PreTrainedTokenizerBase, text: str, max_tokens: int)
     return tok.decode(ids)
 
 
-def generate_continuations(model: PreTrainedModel, tok: PreTrainedTokenizerBase, prompts: List[str], max_new_tokens: int, temperature: float, top_p: float) -> Tuple[torch.Tensor, List[int]]:
+def generate_continuations(
+    model: PreTrainedModel,
+    tok: PreTrainedTokenizerBase,
+    prompts: List[str],
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    micro_batch: int,
+) -> Tuple[torch.Tensor, List[int]]:
+    """Generate in micro-batches to cap peak memory."""
     model_for_gen = getattr(model, "module", model)
     model_for_gen.eval()
+    all_out: List[torch.Tensor] = []
+    all_plen: List[int] = []
     with torch.no_grad():
-        batch = tok(prompts, return_tensors="pt", padding=True, truncation=True)
-        batch = {k: v.to(device_of(model_for_gen)) for k, v in batch.items()}
-        gen = model_for_gen.generate(
-            **batch,
-            do_sample=True,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            pad_token_id=tok.pad_token_id,
-            eos_token_id=tok.eos_token_id,
-        )
-        prompt_lengths = batch["input_ids"].ne(tok.pad_token_id).sum(dim=1).tolist()
-        return gen, prompt_lengths
+        for i in range(0, len(prompts), max(1, micro_batch)):
+            chunk = prompts[i : i + max(1, micro_batch)]
+            batch = tok(chunk, return_tensors="pt", padding=True, truncation=True)
+            batch = {k: v.to(device_of(model_for_gen)) for k, v in batch.items()}
+            gen = model_for_gen.generate(
+                **batch,
+                do_sample=True,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                pad_token_id=tok.pad_token_id,
+                eos_token_id=tok.eos_token_id,
+            )
+            pl = batch["input_ids"].ne(tok.pad_token_id).sum(dim=1).tolist()
+            all_out.append(gen)
+            all_plen.extend(pl)
+    return torch.cat(all_out, dim=0), all_plen
 
 
-def logits_and_logprobs(model: PreTrainedModel, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    logits = model(input_ids=input_ids, attention_mask=attention_mask).logits  # [B,T,V]
-    logp = nn.functional.log_softmax(logits, dim=-1)
-    return logits, logp
+def logits_and_logprobs(
+    model: PreTrainedModel,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    micro_batch: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute logits/logprobs in micro-batches along batch dimension."""
+    outs_l: List[torch.Tensor] = []
+    outs_lp: List[torch.Tensor] = []
+    for i in range(0, input_ids.size(0), max(1, micro_batch)):
+        sl = slice(i, i + max(1, micro_batch))
+        logits = model(input_ids=input_ids[sl], attention_mask=attention_mask[sl]).logits  # [b,T,V]
+        logp = nn.functional.log_softmax(logits, dim=-1)
+        outs_l.append(logits)
+        outs_lp.append(logp)
+    return torch.cat(outs_l, dim=0), torch.cat(outs_lp, dim=0)
 
 
 def per_position_exact_kl(logp_s: torch.Tensor, logp_t: torch.Tensor, kind: str) -> torch.Tensor:
@@ -194,15 +224,15 @@ def gather_logp_for_targets(logp: torch.Tensor, input_ids: torch.Tensor) -> torc
 
 def train_step(student: PreTrainedModel, teacher: PreTrainedModel, tok: PreTrainedTokenizerBase, prompts: List[str], cfg: Config, accelerator: Accelerator, optimizer: torch.optim.Optimizer) -> dict:
     # 1) 学生 on-policy 采样
-    seq_std, plen = generate_continuations(student, tok, prompts, cfg.max_new_tokens, cfg.temperature, cfg.top_p)
+    seq_std, plen = generate_continuations(student, tok, prompts, cfg.max_new_tokens, cfg.temperature, cfg.top_p, cfg.gen_micro_batch)
     am_std = seq_std.ne(tok.pad_token_id).long()
 
     # 2) 学生与老师在学生序列上的分布
     teacher.eval()
     with torch.no_grad():
-        _, logp_t_std = logits_and_logprobs(teacher, seq_std, am_std)
+        _, logp_t_std = logits_and_logprobs(teacher, seq_std, am_std, cfg.lp_micro_batch)
     student.train()
-    logit_s_std, logp_s_std = logits_and_logprobs(student, seq_std, am_std)
+    logit_s_std, logp_s_std = logits_and_logprobs(student, seq_std, am_std, cfg.lp_micro_batch)
 
     # 3) 计算 per-position 反向 KL 指标 D_rkl（用于门控）
     if cfg.rkl == "exact":
@@ -285,6 +315,12 @@ def main(cfg: Config) -> None:
     student = AutoModelForCausalLM.from_pretrained(cfg.student_model, torch_dtype=torch_dtype if torch_dtype else None)
     teacher = AutoModelForCausalLM.from_pretrained(cfg.teacher_model, torch_dtype=torch_dtype if torch_dtype else None)
     tok = AutoTokenizer.from_pretrained(cfg.student_model)
+    # decoder-only models prefer left padding for generation efficiency
+    try:
+        if getattr(tok, "pad_token_id", None) is not None:
+            tok.padding_side = "left"
+    except Exception:
+        pass
     ensure_pad_token(tok)
 
     # LoRA（可选）
@@ -406,6 +442,8 @@ def parse_args() -> Config:
     p.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline", "disabled"])
     p.add_argument("--teacher_ds_zero3", action="store_true", help="使用 DeepSpeed ZeRO-3 对 teacher 做推理分片")
     p.add_argument("--teacher_ds_config", type=str, default=None, help="DeepSpeed 配置文件（可选）")
+    p.add_argument("--gen_micro_batch", type=int, default=8, help="生成阶段的微批大小")
+    p.add_argument("--lp_micro_batch", type=int, default=8, help="logprob 前向计算的微批大小")
     a = p.parse_args()
     return Config(
         student_model=a.student_model,
@@ -441,6 +479,8 @@ def parse_args() -> Config:
         wandb_mode=a.wandb_mode,
         teacher_ds_zero3=a.teacher_ds_zero3,
         teacher_ds_config=a.teacher_ds_config,
+        gen_micro_batch=a.gen_micro_batch,
+        lp_micro_batch=a.lp_micro_batch,
     )
 
 

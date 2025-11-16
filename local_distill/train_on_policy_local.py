@@ -62,6 +62,9 @@ class Config:
     # DeepSpeed options (teacher inference sharding)
     teacher_ds_zero3: bool = False
     teacher_ds_config: str | None = None
+    # Micro-batching to reduce peak memory on student
+    gen_micro_batch: int = 8
+    lp_micro_batch: int = 8
 
 
 def load_prompts(path: str | None) -> List[str]:
@@ -147,32 +150,35 @@ def generate_continuations(
     max_new_tokens: int,
     temperature: float,
     top_p: float,
+    micro_batch: int,
 ) -> Tuple[torch.Tensor, List[int]]:
     # unwrap if DDP-wrapped
     model_for_gen = getattr(model, "module", model)
     model_for_gen.eval()
+    outs: List[torch.Tensor] = []
+    plens: List[int] = []
     with torch.no_grad():
-        batch = tokenizer(
-            prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-        )
-        batch = {k: v.to(next(model_for_gen.parameters()).device) for k, v in batch.items()}
-
-        gen = model_for_gen.generate(
-            **batch,
-            do_sample=True,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
-
-        # Return generated full sequences and original prompt lengths per item
-        prompt_lengths = batch["input_ids"].ne(tokenizer.pad_token_id).sum(dim=1).tolist()
-        return gen, prompt_lengths
+        for i in range(0, len(prompts), max(1, micro_batch)):
+            chunk = prompts[i : i + max(1, micro_batch)]
+            batch = tokenizer(
+                chunk,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+            )
+            batch = {k: v.to(next(model_for_gen.parameters()).device) for k, v in batch.items()}
+            gen = model_for_gen.generate(
+                **batch,
+                do_sample=True,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+            outs.append(gen)
+            plens.extend(batch["input_ids"].ne(tokenizer.pad_token_id).sum(dim=1).tolist())
+    return torch.cat(outs, dim=0), plens
 
 
 def sequence_logprobs(
@@ -181,12 +187,11 @@ def sequence_logprobs(
     attention_mask: torch.Tensor,
 ) -> torch.Tensor:
     """Return per-token logprobs for targets (shifted) with shape [B, T-1]."""
-    logits = model(input_ids=input_ids, attention_mask=attention_mask).logits  # [B, T, V]
+    logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
     logprobs = nn.functional.log_softmax(logits, dim=-1)
-    # Shift for next-token prediction
-    target_ids = input_ids[:, 1:]  # [B, T-1]
-    logprobs = logprobs[:, :-1, :]  # [B, T-1, V]
-    gathered = logprobs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)  # [B, T-1]
+    target_ids = input_ids[:, 1:]
+    logprobs = logprobs[:, :-1, :]
+    gathered = logprobs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
     return gathered
 
 
@@ -217,7 +222,7 @@ def train_step(
 ) -> dict:
     # 1) Sample with the student (no grad)
     full_seqs, prompt_lengths = generate_continuations(
-        student, tokenizer, prompts, cfg.max_new_tokens, cfg.temperature, cfg.top_p
+        student, tokenizer, prompts, cfg.max_new_tokens, cfg.temperature, cfg.top_p, cfg.gen_micro_batch
     )
 
     attention_mask = full_seqs.ne(tokenizer.pad_token_id).long()
@@ -225,7 +230,11 @@ def train_step(
     # 2) Compute per-token logprobs for teacher (no grad) and student (with grad)
     teacher.eval()
     with torch.no_grad():
-        teach_lp = sequence_logprobs(teacher, full_seqs, attention_mask)  # [B, T-1]
+        parts_t: List[torch.Tensor] = []
+        for i in range(0, full_seqs.size(0), max(1, cfg.lp_micro_batch)):
+            sl = slice(i, i + max(1, cfg.lp_micro_batch))
+            parts_t.append(sequence_logprobs(teacher, full_seqs[sl], attention_mask[sl]))
+        teach_lp = torch.cat(parts_t, dim=0)  # [B, T-1]
 
     student.train()
     # AMP for student forward/backward
@@ -246,7 +255,11 @@ def train_step(
         ctx = _Null()
 
     with ctx:
-        stud_lp = sequence_logprobs(student, full_seqs, attention_mask)  # [B, T-1]
+        parts_s: List[torch.Tensor] = []
+        for i in range(0, full_seqs.size(0), max(1, cfg.lp_micro_batch)):
+            sl = slice(i, i + max(1, cfg.lp_micro_batch))
+            parts_s.append(sequence_logprobs(student, full_seqs[sl], attention_mask[sl]))
+        stud_lp = torch.cat(parts_s, dim=0)  # [B, T-1]
 
     # Build mask for continuation tokens (exclude prompt tokens)
     # Position t in stud_lp corresponds to token at input_ids[:, t+1]
@@ -306,6 +319,11 @@ def main(cfg: Config) -> None:
         cfg.teacher_model, torch_dtype=torch_dtype if torch_dtype is not None else None
     )
     tokenizer = AutoTokenizer.from_pretrained(cfg.student_model)
+    try:
+        if getattr(tokenizer, "pad_token_id", None) is not None:
+            tokenizer.padding_side = "left"
+    except Exception:
+        pass
     ensure_pad_token(tokenizer)
 
     # Optional LoRA (apply before prepare)
@@ -403,10 +421,16 @@ def main(cfg: Config) -> None:
             # quick post-KL estimate on a small sample
             with torch.no_grad():
                 eval_prompts = prompts[: min(4, len(prompts))]
-                seqs, plens = generate_continuations(student, tokenizer, eval_prompts, cfg.max_new_tokens, cfg.temperature, cfg.top_p)
+                seqs, plens = generate_continuations(student, tokenizer, eval_prompts, cfg.max_new_tokens, cfg.temperature, cfg.top_p, cfg.gen_micro_batch)
                 am = seqs.ne(tokenizer.pad_token_id).long()
-                stud_lp = sequence_logprobs(student, seqs, am)
-                teach_lp = sequence_logprobs(teacher, seqs, am)
+                # micro-batched logprobs for eval as well
+                s_parts, t_parts = [], []
+                for i in range(0, seqs.size(0), max(1, cfg.lp_micro_batch)):
+                    sl = slice(i, i + max(1, cfg.lp_micro_batch))
+                    s_parts.append(sequence_logprobs(student, seqs[sl], am[sl]))
+                    t_parts.append(sequence_logprobs(teacher, seqs[sl], am[sl]))
+                stud_lp = torch.cat(s_parts, dim=0)
+                teach_lp = torch.cat(t_parts, dim=0)
                 # mask continuation
                 cont_mask = torch.zeros_like(stud_lp, dtype=torch.bool)
                 for i, L in enumerate(plens):
@@ -473,6 +497,8 @@ def parse_args() -> Config:
     p.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline", "disabled"])
     p.add_argument("--teacher_ds_zero3", action="store_true", help="使用 DeepSpeed ZeRO-3 对 teacher 做推理分片")
     p.add_argument("--teacher_ds_config", type=str, default=None, help="DeepSpeed 配置文件（可选），未提供则使用内置零三推理配置")
+    p.add_argument("--gen_micro_batch", type=int, default=8, help="生成阶段微批大小")
+    p.add_argument("--lp_micro_batch", type=int, default=8, help="logprob 前向微批大小")
     a = p.parse_args()
     return Config(
         student_model=a.student_model,
@@ -505,6 +531,8 @@ def parse_args() -> Config:
         wandb_mode=a.wandb_mode,
         teacher_ds_zero3=a.teacher_ds_zero3,
         teacher_ds_config=a.teacher_ds_config,
+        gen_micro_batch=a.gen_micro_batch,
+        lp_micro_batch=a.lp_micro_batch,
     )
 
 

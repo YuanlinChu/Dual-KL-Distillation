@@ -19,6 +19,7 @@
   --tau 1.0 --alpha 5.0 --gating soft --rkl exact --fkl full \
   --wandb_project dualkl-distill --wandb_name qwen8b_dualkl \
   --teacher_ds_zero3  # 教师 32B 建议启用 ZeRO-3 推理分片；可选 --teacher_ds_config path/to/ds_zero3_infer.json
+  --gen_micro_batch 4 --lp_micro_batch 8  # 学生生成/前向的微批，避免 OOM
 
 参数说明（与 local_distill 对齐的基础上新增）
 - 门控与 KL：
@@ -37,4 +38,6 @@
 - exact RKL/FKL 需要同时拿到学生与老师全词表分布，显存/算力开销较 `mc/argmax` 更大；可先用 `rkl=mc` + `fkl=full` 折中。
 - 只对续写 token 计算损失；prompt 段掩码不参与。
 - 未定细节（如 top-k 截断 KL、分布平滑、阈值自适应）可在后续迭代中加入。
- - 强烈建议：学生保持 Accelerate DDP；教师仅做推理并用 DeepSpeed ZeRO-3 分片，避免每张卡常驻 32B 权重导致 OOM。
+- 强烈建议：学生保持 Accelerate DDP；教师仅做推理并用 DeepSpeed ZeRO-3 分片，避免每张卡常驻 32B 权重导致 OOM。
+ - 对 decoder-only 模型（如 Qwen3），已自动设置 `tokenizer.padding_side = 'left'` 以减少生成阶段的无效计算。
+ - 若仍 OOM，先降低 `--gen_micro_batch`，再降低 `--lp_micro_batch`，然后再考虑调小 `--group_size` / `--batch_size` / `--max_new_tokens`。

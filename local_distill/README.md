@@ -30,6 +30,7 @@
      --batch_size 256 --group_size 4 --grad_accum 8 \
      --max_new_tokens 512 --use_lora --lora_r 64 \
      --dtype bf16 --save_every 200 \
+     --gen_micro_batch 4 --lp_micro_batch 8 \
      --wandb_project onpolicy-distill --wandb_name qwen8b_tulu3
 
    # 4 卡：将 accelerate_config_multi_gpu.yaml 中 num_processes 改为 4 即可
@@ -45,7 +46,7 @@
      --student_model Qwen/Qwen3-8B --teacher_model Qwen/Qwen3-32B \
      --dataset tulu3 --batch_size 256 --group_size 4 --grad_accum 8 \
      --max_new_tokens 512 --use_lora --lora_r 64 --dtype bf16 \
-     --teacher_ds_zero3  # 可选：--teacher_ds_config path/to/ds_zero3_infer.json
+     --teacher_ds_zero3 --gen_micro_batch 4 --lp_micro_batch 8  # 可选：--teacher_ds_config path/to/ds_zero3_infer.json
 
 说明
 - 可用 `--dataset deepmath|tulu3`（需 datasets）或通过 `--prompts_file` 指定自定义 prompt（每行一个）。
@@ -96,6 +97,7 @@
   - 教师：使用 `--teacher_ds_zero3` 将教师以 ZeRO-3 推理分片方式加载，避免在每张卡上重复常驻 32B 权重导致 OOM。
   - 若需自定义配置可用 `--teacher_ds_config your_ds_config.json`（不提供则用内置零三推理配置）。
   - 与 accelerate 的 `--deepspeed_config_file`（面向训练/优化器的 ZeRO）可独立使用，两者互不冲突。
+  - 对 decoder-only 模型，脚本已自动设置 `padding_side='left'`；若仍 OOM，请优先调小 `--gen_micro_batch`/`--lp_micro_batch`。
 
 - Token 统计与吞吐
   - 脚本会记录 reverse KL、loss、token 数（续写部分）。
