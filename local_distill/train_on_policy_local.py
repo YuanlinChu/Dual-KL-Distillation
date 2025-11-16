@@ -18,6 +18,11 @@ from transformers import (
 )
 from accelerate import Accelerator
 try:
+    import deepspeed  # type: ignore
+    DEEPSPEED_AVAILABLE = True
+except Exception:
+    DEEPSPEED_AVAILABLE = False
+try:
     from peft import LoraConfig, get_peft_model, PeftModel
     PEFT_AVAILABLE = True
 except Exception:
@@ -54,6 +59,9 @@ class Config:
     wandb_project: str | None = None
     wandb_name: str | None = None
     wandb_mode: str = "online"  # online|offline|disabled
+    # DeepSpeed options (teacher inference sharding)
+    teacher_ds_zero3: bool = False
+    teacher_ds_config: str | None = None
 
 
 def load_prompts(path: str | None) -> List[str]:
@@ -326,8 +334,35 @@ def main(cfg: Config) -> None:
     # Optimizer
     optimizer = AdamW(student.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
 
-    # Prepare with Accelerator (DDP/ZeRO handled externally by accelerate launch/config)
-    student, teacher, optimizer = accelerator.prepare(student, teacher, optimizer)
+    # Prepare student with Accelerator DDP; keep teacher out of accelerator to avoid DDP replication
+    student, optimizer = accelerator.prepare(student, optimizer)
+
+    # Configure teacher for ZeRO-3 inference sharding (no grads, no optimizer)
+    for p in teacher.parameters():
+        p.requires_grad_(False)
+    if cfg.teacher_ds_zero3:
+        if not DEEPSPEED_AVAILABLE:
+            raise RuntimeError("需要 deepspeed 用于教师模型 ZeRO-3 分片，请先安装 deepspeed")
+        # Default ZeRO-3 inference config if not provided
+        ds_cfg = {
+            "train_micro_batch_size_per_gpu": 1,
+            "bf16": {"enabled": cfg.dtype.lower() == "bf16"},
+            "fp16": {"enabled": cfg.dtype.lower() == "fp16"},
+            "zero_optimization": {
+                "stage": 3,
+                "overlap_comm": True,
+                "contiguous_gradients": True,
+                "reduce_bucket_size": "auto",
+                "stage3_prefetch_bucket_size": "auto",
+                "stage3_param_persistence_threshold": "auto",
+                "stage3_gather_16bit_weights_on_model_save": False,
+            },
+        }
+        if cfg.teacher_ds_config and os.path.exists(cfg.teacher_ds_config):
+            import json
+            with open(cfg.teacher_ds_config, "r") as f:
+                ds_cfg = json.load(f)
+        teacher, _, _, _ = deepspeed.initialize(model=teacher, model_parameters=None, config=ds_cfg)
 
     prompts = get_prompts(cfg)
     step = 0
@@ -436,6 +471,8 @@ def parse_args() -> Config:
     p.add_argument("--wandb_project", type=str, default=None)
     p.add_argument("--wandb_name", type=str, default=None)
     p.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline", "disabled"])
+    p.add_argument("--teacher_ds_zero3", action="store_true", help="使用 DeepSpeed ZeRO-3 对 teacher 做推理分片")
+    p.add_argument("--teacher_ds_config", type=str, default=None, help="DeepSpeed 配置文件（可选），未提供则使用内置零三推理配置")
     a = p.parse_args()
     return Config(
         student_model=a.student_model,
@@ -466,6 +503,8 @@ def parse_args() -> Config:
         wandb_project=a.wandb_project,
         wandb_name=a.wandb_name,
         wandb_mode=a.wandb_mode,
+        teacher_ds_zero3=a.teacher_ds_zero3,
+        teacher_ds_config=a.teacher_ds_config,
     )
 
 

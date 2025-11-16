@@ -24,8 +24,8 @@
    # 2 卡（bf16），使用默认的 accelerate 配置
    accelerate launch --config_file local_distill/accelerate_config_multi_gpu.yaml \
      -m local_distill.train_on_policy_local \
-     --student_model Qwen/Qwen2.5-8B \
-     --teacher_model Qwen/Qwen2.5-32B-Instruct \
+     --student_model Qwen/Qwen3-8B \
+     --teacher_model Qwen/Qwen3-32B \
      --dataset tulu3 \
      --batch_size 256 --group_size 4 --grad_accum 8 \
      --max_new_tokens 512 --use_lora --lora_r 64 \
@@ -38,6 +38,14 @@
    accelerate launch --config_file local_distill/accelerate_config_multi_gpu.yaml \
      --deepspeed_config_file local_distill/ds_zero2_bf16.json \
      -m local_distill.train_on_policy_local ...（其余参数同上）
+
+   # 重要：当教师为 32B 且显存紧张时，建议仅对教师启用 ZeRO-3 推理分片，学生继续用 DDP：
+   accelerate launch --config_file local_distill/accelerate_config_multi_gpu.yaml \
+     -m local_distill.train_on_policy_local \
+     --student_model Qwen/Qwen3-8B --teacher_model Qwen/Qwen3-32B \
+     --dataset tulu3 --batch_size 256 --group_size 4 --grad_accum 8 \
+     --max_new_tokens 512 --use_lora --lora_r 64 --dtype bf16 \
+     --teacher_ds_zero3  # 可选：--teacher_ds_config path/to/ds_zero3_infer.json
 
 说明
 - 可用 `--dataset deepmath|tulu3`（需 datasets）或通过 `--prompts_file` 指定自定义 prompt（每行一个）。
@@ -84,8 +92,10 @@
   - 确保教师只做前向且不参与梯度；本脚本已强制 teacher.no_grad()。
 
 - DeepSpeed（可选）
-  - 使用 `local_distill/ds_zero2_bf16.json` + accelerate 的 `--deepspeed_config_file` 参数。
-  - ZeRO-2 能显著缓解大模型+长续写的显存压力；一般不需要 ZeRO-3（合并权重时开销大）。
+  - 学生：建议保持 Accelerate DDP 以保证速度。
+  - 教师：使用 `--teacher_ds_zero3` 将教师以 ZeRO-3 推理分片方式加载，避免在每张卡上重复常驻 32B 权重导致 OOM。
+  - 若需自定义配置可用 `--teacher_ds_config your_ds_config.json`（不提供则用内置零三推理配置）。
+  - 与 accelerate 的 `--deepspeed_config_file`（面向训练/优化器的 ZeRO）可独立使用，两者互不冲突。
 
 - Token 统计与吞吐
   - 脚本会记录 reverse KL、loss、token 数（续写部分）。
