@@ -270,7 +270,7 @@ def train_step(
         elif cfg.rkl == "mc":
             s_g_mb = gather_logp_for_targets(logp_s_mb, input_ids_mb)
             t_g_mb = gather_logp_for_targets(logp_t_mb, input_ids_mb)
-            d_rkl_mb = s_g_mb - t_g_mb
+            d_rkl_mb = s_g_mb.detach() - t_g_mb
             adv_mb = -(s_g_mb - t_g_mb)
             rkl_loss_pos = -adv_mb * s_g_mb
         else:

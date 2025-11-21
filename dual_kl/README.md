@@ -11,7 +11,7 @@
 - pip install torch transformers peft datasets accelerate wandb deepspeed
 
 快速启动（4 卡 A800，bf16）
-- accelerate launch --config_file local_distill/accelerate_config_multi_gpu.yaml \
+- accelerate launch --config_file accelerate_config_multi_gpu.yaml \
   -m dual_kl.train_dualkl \
   --student_model Qwen/Qwen3-4B --teacher_model Qwen/Qwen3-32B \
   --dataset tulu3 --batch_size 256 --group_size 4 --grad_accum 8 \
@@ -22,17 +22,17 @@
   --gen_micro_batch 4 --lp_micro_batch 4  # 学生生成/前向的微批，避免 OOM
   --no_progress  # 如果需要禁用 tqdm 进度条则加上这个参数
 
-参数说明（与 local_distill 对齐的基础上新增
+参数说明（与 on_policy_distill 对齐的基础上新增
 - 门控与 KL：
   - `--tau`：门控阈值，越小越容易走 forward KL。
   - `--alpha`：门控平滑度（sigmoid 斜率），越大越接近硬门控。
   - `--gating`：`soft|hard`，软/硬门控。
   - `--rkl`：`exact|mc`，反向 KL 的计算方式；`exact` 为全词表，`mc` 为采样 token 近似（与 on-policy 版本一致）。
   - `--fkl`：`full|argmax`，正向 KL 的计算方式；`full` 用全词表期望（cross-entropy），`argmax` 用老师 argmax token 的 CE 近似。
-- 其余与 local_distill 相同：LoRA、bf16、group_size、grad_accum、wandb、dataset/prompts。
+- 其余与 on_policy_distill 相同：LoRA、bf16、group_size、grad_accum、wandb、dataset/prompts。
 
-建议超参（与 local_distill 相同基础上）：
-- 1.7B：`--tau 1.0 --alpha 5.0 --gating soft --rkl exact --fkl full`；batch/group/acc 参考 local_distill/README。
+建议超参（与 on_policy_distill 相同基础上）：
+- 1.7B：`--tau 1.0 --alpha 5.0 --gating soft --rkl exact --fkl full`；batch/group/acc 参考 on_policy_distill/README。
 - 4B/8B：同上；OOM 时优先降 `--group_size` 与 `--max_new_tokens`，或启用 DeepSpeed ZeRO-2。
 
 说明

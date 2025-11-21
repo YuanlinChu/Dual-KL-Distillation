@@ -14,7 +14,7 @@
 
 2) CPU 小模型演示（玩具数据）：
 
-   python -m local_distill.train_on_policy_local \
+   python -m on_policy_distill.train_on_policy_local \
      --student_model sshleifer/tiny-gpt2 \
      --teacher_model sshleifer/tiny-gpt2 \
      --steps 3 --batch_size 2 --max_new_tokens 16 --group_size 2
@@ -22,8 +22,8 @@
 3) 单机多卡（2×A800 或 4×A800）分布式训练（建议）：
 
    # 2 卡（bf16），使用默认的 accelerate 配置
-   accelerate launch --config_file local_distill/accelerate_config_multi_gpu.yaml \
-     -m local_distill.train_on_policy_local \
+   accelerate launch --config_file on_policy_distill/accelerate_config_multi_gpu.yaml \
+     -m on_policy_distill.train_on_policy_local \
      --student_model Qwen/Qwen3-8B \
      --teacher_model Qwen/Qwen3-32B \
      --dataset tulu3 \
@@ -36,13 +36,13 @@
    # 4 卡：将 accelerate_config_multi_gpu.yaml 中 num_processes 改为 4 即可
 
    # 可选：DeepSpeed ZeRO-2（显存友好），示例：
-   accelerate launch --config_file local_distill/accelerate_config_multi_gpu.yaml \
-     --deepspeed_config_file local_distill/ds_zero2_bf16.json \
-     -m local_distill.train_on_policy_local ...（其余参数同上）
+   accelerate launch --config_file accelerate_config_multi_gpu.yaml \
+     --deepspeed_config_file on_policy_distill/ds_zero2_bf16.json \
+     -m on_policy_distill.train_on_policy_local ...（其余参数同上）
 
    # 重要：当教师为 32B 且显存紧张时，建议仅对教师启用 ZeRO-3 推理分片，学生继续用 DDP：
-   accelerate launch --config_file local_distill/accelerate_config_multi_gpu.yaml \
-     -m local_distill.train_on_policy_local \
+   accelerate launch --config_file accelerate_config_multi_gpu.yaml \
+     -m on_policy_distill.train_on_policy_local \
      --student_model Qwen/Qwen3-8B --teacher_model Qwen/Qwen3-32B \
      --dataset tulu3 --batch_size 256 --group_size 4 --grad_accum 8 \
      --max_new_tokens 512 --use_lora --lora_r 64 --dtype bf16 \
@@ -55,8 +55,8 @@
 - `--group_size` 对齐 Tinker 的“每个 prompt 多次采样”；`--grad_accum` 对齐 `num_substeps`；`--dtype bf16` 适合 A800；`--use_lora` 适合 4B–8B 学生。
 
 ## 配置文件
-- `local_distill/accelerate_config_multi_gpu.yaml`：单机多卡（默认 2 进程，改 `num_processes` 为 4 即四卡）。
-- `local_distill/ds_zero2_bf16.json`：DeepSpeed ZeRO-2（bf16）示例，可与 accelerate 联用。
+- `accelerate_config_multi_gpu.yaml`：单机多卡（默认 2 进程，改 `num_processes` 为 4 即四卡）。
+- `on_policy_distill/ds_zero2_bf16.json`：DeepSpeed ZeRO-2（bf16）示例，可与 accelerate 联用。
 
 ## 日志与可视化
 - 传入 `--wandb_project your_project` 即可启用 W&B；`--wandb_name` 指定 run 名称；`--wandb_mode offline|disabled` 控制模式。
