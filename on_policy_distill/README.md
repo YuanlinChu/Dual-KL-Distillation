@@ -1,9 +1,14 @@
 # 本地 On-Policy 蒸馏（无需 Tinker）
 
 该原型用 Hugging Face 生态在本地复现实验：学生在 prompt 上按自身策略采样，教师仅提供逐 token 的 logprob，用反向 KL 构造优势并更新学生。
+本实现在工程细节上与 dual_kl 的“微批反向”方案对齐（不改变训练目标）：
+- 生成阶段：微批生成，结果落 CPU，按右侧 padding 对齐后再拼接。
+- 前向/反向：logprob 计算按微批切片，整批 token 数归一化，除最后一片用 no_sync 以减少 AllReduce。
+- 掩码：仅在“续写且非 pad”的位置聚合（valid_mask = continuation ∧ attention_mask[:,1:]）。
+- 缓存：teacher 前向 use_cache=True；student 训练前向 use_cache=False（降低峰值显存）。
 
 - 学生采样续写；教师对同一序列给出 log q。
-- 反向 KL：Δ=log p_student − log p_teacher，优势 A=−coef·Δ（可选折扣）；只对续写部分求损失。
+- 反向 KL：Δ=log p_student − log p_teacher，优势 A=−coef·Δ（MC 近似，可选折扣）；只对续写且非 pad 的位置求损失。
 - 损失：policy gradient 形式的加权 NLL，loss=−∑ A_t·log p_student。
 
 ## 快速开始
@@ -46,7 +51,8 @@
      --student_model Qwen/Qwen3-8B --teacher_model Qwen/Qwen3-32B \
      --dataset tulu3 --batch_size 256 --group_size 4 --grad_accum 8 \
      --max_new_tokens 512 --use_lora --lora_r 64 --dtype bf16 \
-     --teacher_ds_zero3 --gen_micro_batch 4 --lp_micro_batch 8  # 可选：--teacher_ds_config path/to/ds_zero3_infer.json
+     --teacher_ds_zero3 --gen_micro_batch 4 --lp_micro_batch 8  
+     # 可选：--teacher_ds_config path/to/ds_zero3_infer.json
 
 说明
 - 可用 `--dataset deepmath|tulu3`（需 datasets）或通过 `--prompts_file` 指定自定义 prompt（每行一个）。
@@ -108,6 +114,6 @@
   - 建议开启 W&B 观察 reverse KL 与 loss 是否收敛、是否出现发散或模式坍塌（可适度调低 `--learning_rate` 或增大 `--grad_accum`）。
 
 - 其他细节
-  - 只对续写 token 计算 KL 与梯度（prompt 掩码在脚本中已处理）。
+  - 只对续写且非 pad 的 token 计算 KL 与梯度（prompt 与 pad 掩码在脚本中已处理）。
   - 使用内置数据集：`--dataset tulu3|deepmath`；或 `--prompts_file your_prompts.txt`（每行一个 prompt）。
   - 想完全贴齐原策略，可将 `--kl_discount` 保持 0；如需对长序列更稳，可尝试 `0.95` 并对比实验。

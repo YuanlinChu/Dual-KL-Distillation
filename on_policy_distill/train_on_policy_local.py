@@ -58,7 +58,7 @@ class Config:
     lora_dropout: float = 0.05
     dtype: str = "bf16"  # bf16|fp16|fp32
     grad_accum: int = 1  # like num_substeps
-    eval_every: int = 50
+    eval_every: int = 100
     dataset: str | None = None  # deepmath|tulu3|None
     max_prompt_tokens: int | None = None
     wandb_project: str | None = None
@@ -159,12 +159,14 @@ def generate_continuations(
     top_p: float,
     micro_batch: int,
     show_progress: bool,
-) -> Tuple[torch.Tensor, List[int]]:
+) -> Tuple[torch.Tensor, List[int], int]:
     # unwrap if DDP-wrapped
     model_for_gen = getattr(model, "module", model)
     model_for_gen.eval()
     outs: List[torch.Tensor] = []
     plens: List[int] = []
+    max_seq_len: int = 0
+    pad_id: int = tokenizer.pad_token_id if getattr(tokenizer, "pad_token_id", None) is not None else 0
     with torch.no_grad():
         iterator = range(0, len(prompts), max(1, micro_batch))
         bar = None
@@ -185,25 +187,48 @@ def generate_continuations(
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 top_p=top_p,
-                pad_token_id=tokenizer.pad_token_id,
+                pad_token_id=pad_id,
                 eos_token_id=tokenizer.eos_token_id,
             )
-            outs.append(gen)
-            plens.extend(batch["input_ids"].ne(tokenizer.pad_token_id).sum(dim=1).tolist())
+            outs.append(gen.detach().cpu())
+            # Track the maximum generated sequence length across micro-batches
+            if gen.size(1) > max_seq_len:
+                max_seq_len = gen.size(1)
+            plens.extend(batch["input_ids"].ne(pad_id).sum(dim=1).tolist())
             if bar is not None:
                 bar.update(len(chunk))
         if bar is not None:
             bar.close()
-    return torch.cat(outs, dim=0), plens
+    # Pad all micro-batch outputs to the same length before concatenation (CPU tensors)
+    if len(outs) == 0:
+        return torch.empty(0, dtype=torch.long), plens, pad_id
+    if max_seq_len > 0:
+        for j in range(len(outs)):
+            seq = outs[j]
+            cur_len = seq.size(1)
+            if cur_len < max_seq_len:
+                padded = torch.full(
+                    (seq.size(0), max_seq_len),
+                    fill_value=pad_id,
+                    dtype=seq.dtype,
+                    device=seq.device,
+                )
+                padded[:, :cur_len] = seq
+                outs[j] = padded
+    return torch.cat(outs, dim=0), plens, pad_id
 
 
 def sequence_logprobs(
     model: PreTrainedModel,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
+    use_cache: bool | None = None,
 ) -> torch.Tensor:
     """Return per-token logprobs for targets (shifted) with shape [B, T-1]."""
-    logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+    kwargs = {}
+    if use_cache is not None:
+        kwargs["use_cache"] = use_cache
+    logits = model(input_ids=input_ids, attention_mask=attention_mask, **kwargs).logits
     logprobs = nn.functional.log_softmax(logits, dim=-1)
     target_ids = input_ids[:, 1:]
     logprobs = logprobs[:, :-1, :]
@@ -237,99 +262,96 @@ def train_step(
     optimizer: torch.optim.Optimizer,
 ) -> dict:
     # 1) Sample with the student (no grad)
-    full_seqs, prompt_lengths = generate_continuations(
+    full_seqs_cpu, prompt_lengths, pad_id = generate_continuations(
         student, tokenizer, prompts,
         cfg.max_new_tokens, cfg.temperature, cfg.top_p,
         cfg.gen_micro_batch,
         cfg.progress and accelerator.is_main_process,
     )
 
-    attention_mask = full_seqs.ne(tokenizer.pad_token_id).long()
+    # 注意：生成结果驻留在 CPU；后续前向时分片搬到 GPU
 
-    # 2) Compute per-token logprobs for teacher (no grad) and student (with grad)
-    teacher.eval()
-    with torch.no_grad():
-        parts_t: List[torch.Tensor] = []
-        iterator_t = range(0, full_seqs.size(0), max(1, cfg.lp_micro_batch))
-        bar_t = None
-        if cfg.progress and _HAVE_TQDM and accelerator.is_main_process:
-            bar_t = tqdm(total=full_seqs.size(0), desc="teacher lp", leave=False, dynamic_ncols=True)
-        for i in iterator_t:
-            sl = slice(i, i + max(1, cfg.lp_micro_batch))
-            parts_t.append(sequence_logprobs(teacher, full_seqs[sl], attention_mask[sl]))
-            if bar_t is not None:
-                bar_t.update(full_seqs[sl].size(0))
-        if bar_t is not None:
-            bar_t.close()
-        teach_lp = torch.cat(parts_t, dim=0)  # [B, T-1]
-
-    student.train()
-    # AMP for student forward/backward
-    use_bf16 = cfg.dtype.lower() == "bf16" and torch.cuda.is_available()
-    use_fp16 = cfg.dtype.lower() == "fp16" and torch.cuda.is_available()
-    autocast_dtype = torch.bfloat16 if use_bf16 else (torch.float16 if use_fp16 else None)
-    if autocast_dtype is not None:
-        ctx = torch.autocast(device_type="cuda", dtype=autocast_dtype)
-    else:
-        # no-op context manager
-        class _Null:
-            def __enter__(self):
-                return None
-
-            def __exit__(self, *args):
-                return False
-
-        ctx = _Null()
-
-    with ctx:
-        parts_s: List[torch.Tensor] = []
-        iterator_s = range(0, full_seqs.size(0), max(1, cfg.lp_micro_batch))
-        bar_s = None
-        if cfg.progress and _HAVE_TQDM and accelerator.is_main_process:
-            bar_s = tqdm(total=full_seqs.size(0), desc="student lp", leave=False, dynamic_ncols=True)
-        for i in iterator_s:
-            sl = slice(i, i + max(1, cfg.lp_micro_batch))
-            parts_s.append(sequence_logprobs(student, full_seqs[sl], attention_mask[sl]))
-            if bar_s is not None:
-                bar_s.update(full_seqs[sl].size(0))
-        if bar_s is not None:
-            bar_s.close()
-        stud_lp = torch.cat(parts_s, dim=0)  # [B, T-1]
-
-    # Build mask for continuation tokens (exclude prompt tokens)
-    # Position t in stud_lp corresponds to token at input_ids[:, t+1]
-    B, Tp = stud_lp.shape
-    cont_mask = torch.zeros_like(stud_lp, dtype=torch.bool)
+    # 2) 构造续写掩码与总有效 token 数（续写且非 pad）
+    B = full_seqs_cpu.size(0)
+    T = full_seqs_cpu.size(1)
+    # cont_mask 形状 [B, T-1]
+    cont_mask = torch.zeros((B, T - 1), dtype=torch.bool)
     for i, L in enumerate(prompt_lengths):
-        # tokens >= L belong to continuation; in stud_lp index space, that's t >= L-1
         start = max(L - 1, 0)
-        cont_mask[i, start:] = True
+        if start < T - 1:
+            cont_mask[i, start:] = True
+    attn_full = full_seqs_cpu.ne(pad_id)
+    valid_mask_full = cont_mask & attn_full[:, 1:].bool()
+    tokens_total = int(valid_mask_full.sum().item())
+    if tokens_total == 0:
+        return {"loss": 0.0, "reverse_kl": 0.0, "tokens": 0}
 
-    # 3) Compute advantages from reverse KL: A = -coef*(log p_s - log p_t)
-    with torch.no_grad():
-        delta = stud_lp.detach() - teach_lp  # [B, T-1]
-        adv = -cfg.kl_coef * delta
+    # 3) 微批前向 + 反向（与 dual_kl 微批反向对齐）
+    teacher.eval()
+    student.train()
+    mb = max(1, cfg.lp_micro_batch)
+    bar_lp = None
+    if cfg.progress and _HAVE_TQDM and accelerator.is_main_process:
+        bar_lp = tqdm(total=B, desc="lp/back", leave=False, dynamic_ncols=True)
+
+    # 指标累计
+    d_rkl_sum = torch.tensor(0.0, device=accelerator.device)
+    tokens_accum = torch.tensor(0.0, device=accelerator.device)
+    loss_sum = torch.tensor(0.0, device=accelerator.device)
+
+    for i in range(0, B, mb):
+        sl = slice(i, i + mb)
+        ids_mb = full_seqs_cpu[sl].to(accelerator.device, non_blocking=True)
+        attn_mb = ids_mb.ne(pad_id).long()
+        valid_mask_mb = (cont_mask[sl].to(accelerator.device)) & attn_mb[:, 1:].bool()
+
+        with accelerator.autocast():
+            with torch.no_grad():
+                logits_t = teacher(input_ids=ids_mb, attention_mask=attn_mb, use_cache=True).logits
+                logp_t_mb = nn.functional.log_softmax(logits_t, dim=-1)
+            logits_s = student(input_ids=ids_mb, attention_mask=attn_mb, use_cache=False).logits
+            logp_s_mb = nn.functional.log_softmax(logits_s, dim=-1)
+        del logits_t, logits_s
+
+        # 反向 KL 的 MC 优势（detach），可选时序折扣
+        s_g_mb = logp_s_mb[:, :-1, :].gather(-1, ids_mb[:, 1:].unsqueeze(-1)).squeeze(-1)
+        t_g_mb = logp_t_mb[:, :-1, :].gather(-1, ids_mb[:, 1:].unsqueeze(-1)).squeeze(-1)
+        d_rkl_mb = (s_g_mb.detach() - t_g_mb)  # 仅作指标/门控
+        adv_mb = -(s_g_mb - t_g_mb).detach() * cfg.kl_coef
         if cfg.kl_discount > 0:
-            adv = discounted_future_sum(adv, cfg.kl_discount)
-        # Optional variance reduction: center across valid tokens
-        denom = cont_mask.sum().clamp_min(1)
-        mean_adv = (adv.masked_select(cont_mask).sum() / denom).detach()
-        adv = adv - mean_adv
+            adv_mb = discounted_future_sum(adv_mb, cfg.kl_discount)
+        rkl_loss_pos = -adv_mb * s_g_mb
 
-    # 4) Policy gradient style weighted NLL on student
-    loss_terms = -adv * stud_lp  # [B, T-1]
-    loss = loss_terms.masked_select(cont_mask).mean()
+        # 按整批 token 总数归一化，逐片反向；除最后一片外 no_sync 降低 AllReduce
+        loss_mb = rkl_loss_pos.masked_select(valid_mask_mb).sum() / float(tokens_total)
+        is_last = (i + mb) >= B
+        if not is_last:
+            with accelerator.no_sync(student):
+                accelerator.backward(loss_mb)
+        else:
+            accelerator.backward(loss_mb)
 
-    accelerator.backward(loss)
+        # 累计指标（标量），用于最终聚合
+        d_rkl_sum = d_rkl_sum + d_rkl_mb.masked_select(valid_mask_mb).detach().sum()
+        tokens_accum = tokens_accum + valid_mask_mb.sum().detach()
+        loss_sum = loss_sum + loss_mb.detach()
 
-    # Metrics
-    rev_kl = delta.masked_select(cont_mask).mean()
-    tokens = cont_mask.sum()
-    # Gather metrics across processes
-    rev_kl_mean = accelerator.gather_for_metrics(rev_kl.detach()).mean().item()
-    tokens_sum = accelerator.gather_for_metrics(tokens.detach()).sum().item()
-    loss_val = accelerator.gather_for_metrics(loss.detach()).mean().item()
-    return {"loss": float(loss_val), "reverse_kl": float(rev_kl_mean), "tokens": int(tokens_sum)}
+        if bar_lp is not None:
+            bar_lp.update(ids_mb.size(0))
+
+        # 释放切片张量
+        del ids_mb, attn_mb, valid_mask_mb, logp_t_mb, logp_s_mb, s_g_mb, t_g_mb, rkl_loss_pos, loss_mb, d_rkl_mb, adv_mb
+
+    if bar_lp is not None:
+        bar_lp.close()
+
+    # 跨进程聚合指标
+    rev_kl_mean = (
+        accelerator.gather_for_metrics(d_rkl_sum).sum() / accelerator.gather_for_metrics(tokens_accum).sum()
+    ).item()
+    tokens = int(accelerator.gather_for_metrics(tokens_accum).sum().item())
+    loss_val = accelerator.gather_for_metrics(loss_sum).mean().item()
+    return {"loss": float(loss_val), "reverse_kl": float(rev_kl_mean), "tokens": tokens}
 
 
 def main(cfg: Config) -> None:
@@ -348,10 +370,10 @@ def main(cfg: Config) -> None:
         torch.bfloat16 if cfg.dtype.lower() == "bf16" else torch.float16 if cfg.dtype.lower() == "fp16" else None
     )
     student = AutoModelForCausalLM.from_pretrained(
-        cfg.student_model, torch_dtype=torch_dtype if torch_dtype is not None else None
+        cfg.student_model, dtype=torch_dtype if torch_dtype is not None else None
     )
     teacher = AutoModelForCausalLM.from_pretrained(
-        cfg.teacher_model, torch_dtype=torch_dtype if torch_dtype is not None else None
+        cfg.teacher_model, dtype=torch_dtype if torch_dtype is not None else None
     )
     tokenizer = AutoTokenizer.from_pretrained(cfg.student_model)
     try:
@@ -452,33 +474,46 @@ def main(cfg: Config) -> None:
         if cfg.wandb_project:
             accelerator.log({"train/loss": metrics["loss"], "train/reverse_kl": metrics["reverse_kl"], "train/tokens": metrics["tokens"], "train/step": step}, step=step)
 
-        if accelerator.is_main_process and cfg.eval_every > 0 and step % cfg.eval_every == 0:
-            # quick post-KL estimate on a small sample
+        if cfg.eval_every > 0 and step % cfg.eval_every == 0:
+            # 在所有进程上执行 eval，避免 ZeRO-3 教师引发的分布式阻塞；只在主进程打印
             with torch.no_grad():
                 eval_prompts = prompts[: min(4, len(prompts))]
-                seqs, plens = generate_continuations(
+                seqs_cpu, plens, pad_id = generate_continuations(
                     student, tokenizer, eval_prompts,
                     cfg.max_new_tokens, cfg.temperature, cfg.top_p,
                     cfg.gen_micro_batch,
                     cfg.progress and accelerator.is_main_process,
                 )
-                am = seqs.ne(tokenizer.pad_token_id).long()
-                # micro-batched logprobs for eval as well
-                s_parts, t_parts = [], []
-                it_eval = range(0, seqs.size(0), max(1, cfg.lp_micro_batch))
-                for i in it_eval:
-                    sl = slice(i, i + max(1, cfg.lp_micro_batch))
-                    s_parts.append(sequence_logprobs(student, seqs[sl], am[sl]))
-                    t_parts.append(sequence_logprobs(teacher, seqs[sl], am[sl]))
-                stud_lp = torch.cat(s_parts, dim=0)
-                teach_lp = torch.cat(t_parts, dim=0)
-                # mask continuation
-                cont_mask = torch.zeros_like(stud_lp, dtype=torch.bool)
-                for i, L in enumerate(plens):
-                    start_i = max(L - 1, 0)
-                    cont_mask[i, start_i:] = True
-                rev_kl_eval = (stud_lp - teach_lp).masked_select(cont_mask).mean().item()
-                accelerator.print(f"eval reverse_kl={rev_kl_eval:.4f}")
+                # 计算 MC 反向 KL 的均值（续写且非 pad），分布式聚合
+                d_sum = torch.tensor(0.0, device=accelerator.device)
+                tok_sum = torch.tensor(0.0, device=accelerator.device)
+                it_eval = range(0, seqs_cpu.size(0), max(1, cfg.lp_micro_batch))
+                for i_eval in it_eval:
+                    sl = slice(i_eval, i_eval + max(1, cfg.lp_micro_batch))
+                    ids_mb = seqs_cpu[sl].to(accelerator.device, non_blocking=True)
+                    am_mb = ids_mb.ne(pad_id).long()
+                    with accelerator.autocast():
+                        # teacher 用 use_cache=True；student 用 use_cache=False
+                        logits_s = student(input_ids=ids_mb, attention_mask=am_mb, use_cache=False).logits
+                        logits_t = teacher(input_ids=ids_mb, attention_mask=am_mb, use_cache=True).logits
+                        logp_s = nn.functional.log_softmax(logits_s, dim=-1)
+                        logp_t = nn.functional.log_softmax(logits_t, dim=-1)
+                    s_g = logp_s[:, :-1, :].gather(-1, ids_mb[:, 1:].unsqueeze(-1)).squeeze(-1)
+                    t_g = logp_t[:, :-1, :].gather(-1, ids_mb[:, 1:].unsqueeze(-1)).squeeze(-1)
+                    # 有效掩码：续写且非 pad
+                    cont_mask = torch.zeros_like(s_g, dtype=torch.bool)
+                    for j, L in enumerate(plens[sl]):
+                        start_j = max(L - 1, 0)
+                        cont_mask[j, start_j:] = True
+                    valid_mask = cont_mask & am_mb[:, 1:].bool()
+                    d_sum = d_sum + (s_g - t_g).masked_select(valid_mask).sum()
+                    tok_sum = tok_sum + valid_mask.sum()
+                # 跨进程聚合
+                d_all = accelerator.gather_for_metrics(d_sum).sum()
+                t_all = accelerator.gather_for_metrics(tok_sum).sum()
+                rev_kl_eval = (d_all / t_all).item() if t_all.item() > 0 else 0.0
+                if accelerator.is_main_process:
+                    accelerator.print(f"eval reverse_kl={rev_kl_eval:.4f}")
                 if cfg.wandb_project:
                     accelerator.log({"eval/reverse_kl": rev_kl_eval, "train/step": step}, step=step)
 
