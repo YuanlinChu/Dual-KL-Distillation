@@ -1,3 +1,4 @@
 tinker-cookbook/
-dual-kl-out/
+out/
 wandb/
+**/__pycache__/

@@ -115,6 +115,23 @@ def truncate_by_tokens(tok: PreTrainedTokenizerBase, text: str, max_tokens: int)
     ids = ids[:max_tokens]
     return tok.decode(ids)
 
+def per_position_exact_kl(logp_s: torch.Tensor, logp_t: torch.Tensor, kind: str) -> torch.Tensor:
+    """Return per-position exact KL (no aggregation) with shape [B, T-1].
+
+    kind: "rkl" computes KL(p_s || p_t) = sum_v p_s(v)*(log p_s - log p_t)
+          "fkl" computes KL(p_t || p_s) = sum_v p_t(v)*(log p_t - log p_s)
+    Align to next-token prediction by dropping last time step.
+    """
+    lps = logp_s[:, :-1, :]
+    lpt = logp_t[:, :-1, :]
+    ps = lps.exp()
+    pt = lpt.exp()
+    if kind == "rkl":
+        return (ps * (lps - lpt)).sum(dim=-1)
+    elif kind == "fkl":
+        return (pt * (lpt - lps)).sum(dim=-1)
+    else:
+        raise ValueError("kind must be rkl or fkl")
 
 def generate_continuations(
     model: PreTrainedModel,
@@ -249,7 +266,7 @@ def train_step(
         t_g_t = logp_t[:, :-1, :].gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
         s_g_t = logp_s[:, :-1, :].gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
         d_fkl_mb = (t_g_t - s_g_t).detach()
-        adv_f_mb = -d_fkl_mb
+        adv_f_mb = d_fkl_mb    #这个地方先尝试改一下
         fkl_loss_pos = -adv_f_mb * s_g_t
         gF_mb = torch.relu(d_fkl_mb * t_g_t).masked_select(valid_mb).sum().detach()
 
@@ -379,6 +396,57 @@ def main(cfg: Config) -> None:
                 "train/tokens": metrics["tokens"],
                 "train/step": step,
             }, step=step)
+
+        # Exact KL eval on a small subset
+        if cfg.eval_every > 0 and step % cfg.eval_every == 0:
+            with torch.no_grad():
+                k = min(4, len(prompts))
+                eval_prompts = prompts[-k:]
+                seqs_cpu, plens, pad_id = generate_continuations(
+                    student, tok, eval_prompts,
+                    cfg.max_new_tokens, cfg.temperature, cfg.top_p,
+                    cfg.gen_micro_batch,
+                    cfg.progress and accelerator.is_main_process,
+                )
+                r_sum = torch.tensor(0.0, device=accelerator.device)
+                f_sum = torch.tensor(0.0, device=accelerator.device)
+                t_sum = torch.tensor(0.0, device=accelerator.device)
+                it_eval = range(0, seqs_cpu.size(0), max(1, cfg.lp_micro_batch))
+                for i_eval in it_eval:
+                    sl = slice(i_eval, i_eval + max(1, cfg.lp_micro_batch))
+                    ids_mb = seqs_cpu[sl].to(accelerator.device, non_blocking=True)
+                    am_mb = ids_mb.ne(pad_id).long()
+                    with accelerator.autocast():
+                        logits_s = student(input_ids=ids_mb, attention_mask=am_mb, use_cache=False).logits
+                        logits_t = teacher(input_ids=ids_mb, attention_mask=am_mb, use_cache=True).logits
+                        logp_s = nn.functional.log_softmax(logits_s, dim=-1)
+                        logp_t = nn.functional.log_softmax(logits_t, dim=-1)
+                    # per-position exact KL
+                    r_pos = per_position_exact_kl(logp_s, logp_t, kind="rkl")
+                    f_pos = per_position_exact_kl(logp_s, logp_t, kind="fkl")
+                    # valid mask: continuation and non-pad
+                    cont_mb = torch.zeros_like(r_pos, dtype=torch.bool)
+                    for j, L in enumerate(plens[sl]):
+                        start_j = max(L - 1, 0)
+                        cont_mb[j, start_j:] = True
+                    valid_mb = cont_mb & am_mb[:, 1:].bool()
+                    r_sum = r_sum + r_pos.masked_select(valid_mb).sum()
+                    f_sum = f_sum + f_pos.masked_select(valid_mb).sum()
+                    t_sum = t_sum + valid_mb.sum()
+                # aggregate across ranks
+                r_all = accelerator.gather_for_metrics(r_sum).sum()
+                f_all = accelerator.gather_for_metrics(f_sum).sum()
+                t_all = accelerator.gather_for_metrics(t_sum).sum()
+                rkl_exact = (r_all / t_all).item() if t_all.item() > 0 else 0.0
+                fkl_exact = (f_all / t_all).item() if t_all.item() > 0 else 0.0
+                if accelerator.is_main_process:
+                    accelerator.print(f"eval rkl_exact={rkl_exact:.4f} fkl_exact={fkl_exact:.4f}")
+                if cfg.wandb_project:
+                    accelerator.log({
+                        "eval/rkl_exact": rkl_exact,
+                        "eval/fkl_exact": fkl_exact,
+                        "train/step": step,
+                    }, step=step)
 
         if accelerator.is_main_process and cfg.save_every > 0 and step % cfg.save_every == 0:
             ckpt_dir = os.path.join(cfg.output_dir, f"step-{step}")

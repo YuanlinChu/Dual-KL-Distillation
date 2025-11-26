@@ -13,21 +13,8 @@
 安装
 - pip install torch transformers peft datasets accelerate wandb deepspeed
 
-快速启动（4 卡 A800，bf16）
-- accelerate launch --config_file accelerate_config_multi_gpu.yaml \
-  -m dual_kl.train_dualkl \
-  --student_model Qwen/Qwen3-4B --teacher_model Qwen/Qwen3-32B \
-  --dataset tulu3 --batch_size 256 --group_size 4 --grad_accum 8 \
-  --max_new_tokens 256 --use_lora --lora_r 64 --dtype bf16 \
-  --wandb_project dualkl-distill --wandb_name qwen4b_dualkl \
-  --wandb_project dualkl-distill --wandb_name qwen4b_dualkl \
-  --teacher_ds_zero3  # 教师 32B 建议启用 ZeRO-3 推理分片；可选 --teacher_ds_config path/to/ds_zero3_infer.json
-  --gen_micro_batch 4 --lp_micro_batch 4  # 学生生成/前向的微批，避免 OOM
-  --no_progress  # 如果需要禁用 tqdm 进度条则加上这个参数
-
 参数说明
-- 已不再提供 `--tau/--alpha/--gating/--rkl/--fkl` 等旧参数；当前实现采用对称 MC 双向 KL 与标量 gating，无需额外开关。
-- 其余与 on_policy_distill 相同：LoRA、bf16、group_size、grad_accum、wandb、dataset/prompts。
+- 与 on_policy_distill 相同：LoRA、bf16、group_size、grad_accum、wandb、dataset/prompts。
 
 建议超参（与 on_policy_distill 相同基础上）：
 - 1.7B/4B/8B：batch/group/acc 参考 on_policy_distill/README；OOM 时优先降 `--group_size` 与 `--max_new_tokens`，或启用 DeepSpeed ZeRO-2。

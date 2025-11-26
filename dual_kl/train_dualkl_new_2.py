@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 import os
 from dataclasses import dataclass
 from typing import List, Tuple
@@ -21,9 +20,8 @@ try:
     DEEPSPEED_AVAILABLE = True
 except Exception:
     DEEPSPEED_AVAILABLE = False
-
 try:
-    from peft import LoraConfig, get_peft_model, PeftModel
+    from peft import LoraConfig, get_peft_model
     PEFT_AVAILABLE = True
 except Exception:
     PEFT_AVAILABLE = False
@@ -42,13 +40,6 @@ class Config:
     top_p: float = 0.95
     learning_rate: float = 5e-5
     weight_decay: float = 0.0
-    # 双向 KL 相关
-    tau: float = 1.0
-    alpha: float = 5.0
-    gating: str = "soft"  # soft|hard
-    rkl: str = "exact"  # exact|mc
-    fkl: str = "full"  # full|argmax
-    # 其他
     save_every: int = 100
     prompts_file: str | None = None
     dataset: str | None = None
@@ -58,19 +49,19 @@ class Config:
     lora_r: int = 32
     lora_alpha: int = 16
     lora_dropout: float = 0.05
-    dtype: str = "bf16"  # bf16|fp16|fp32
+    dtype: str = "bf16"
     grad_accum: int = 1
     eval_every: int = 50
     wandb_project: str | None = None
     wandb_name: str | None = None
     wandb_mode: str = "online"
-    # DeepSpeed options for teacher sharding
+    # Teacher sharding
     teacher_ds_zero3: bool = False
     teacher_ds_config: str | None = None
-    # Micro-batching to reduce peak memory
-    gen_micro_batch: int = 8   # generation micro-batch size
-    lp_micro_batch: int = 8    # logprob micro-batch size for student/teacher
-    # Progress bar control
+    # Micro-batching
+    gen_micro_batch: int = 8
+    lp_micro_batch: int = 8
+    # Progress
     progress: bool = True
 
 
@@ -95,46 +86,25 @@ def load_prompts(path: str | None) -> List[str]:
         return [line.strip() for line in f if line.strip()]
 
 
-def load_deepmath_prompts() -> List[str] | None:
-    try:
-        from datasets import load_dataset  # type: ignore
-
-        ds = load_dataset("zwhe99/DeepMath-103K", split="train")
-        return [row["question"] for row in ds]  # type: ignore
-    except Exception:
-        return None
-
-
-def load_tulu3_prompts() -> List[str] | None:
-    try:
-        from datasets import load_dataset  # type: ignore
-
-        ds = load_dataset("allenai/tulu-3-sft-mixture", split="train")
-        prompts: List[str] = []
-        for row in ds:  # type: ignore
-            msgs = row["messages"]  # type: ignore
-            for m in msgs:
-                if m.get("role") == "user":
-                    txt = m.get("content", "")
-                    if txt:
-                        prompts.append(txt)
-                    break
-        return prompts
-    except Exception:
-        return None
-
-
 def get_prompts(cfg: Config) -> List[str]:
     if cfg.prompts_file:
         return load_prompts(cfg.prompts_file)
-    if cfg.dataset == "deepmath":
-        p = load_deepmath_prompts()
-        if p:
-            return p
     if cfg.dataset == "tulu3":
-        p = load_tulu3_prompts()
-        if p:
-            return p
+        try:
+            from datasets import load_dataset  # type: ignore
+            ds = load_dataset("allenai/tulu-3-sft-mixture", split="train")
+            out: List[str] = []
+            for row in ds:  # type: ignore
+                msgs = row["messages"]  # type: ignore
+                for m in msgs:
+                    if m.get("role") == "user":
+                        txt = m.get("content", "")
+                        if txt:
+                            out.append(txt)
+                        break
+            return out
+        except Exception:
+            pass
     return load_prompts(None)
 
 
@@ -145,6 +115,23 @@ def truncate_by_tokens(tok: PreTrainedTokenizerBase, text: str, max_tokens: int)
     ids = ids[:max_tokens]
     return tok.decode(ids)
 
+def per_position_exact_kl(logp_s: torch.Tensor, logp_t: torch.Tensor, kind: str) -> torch.Tensor:
+    """Return per-position exact KL (no aggregation) with shape [B, T-1].
+
+    kind: "rkl" computes KL(p_s || p_t) = sum_v p_s(v)*(log p_s - log p_t)
+          "fkl" computes KL(p_t || p_s) = sum_v p_t(v)*(log p_t - log p_s)
+    Align to next-token prediction by dropping last time step.
+    """
+    lps = logp_s[:, :-1, :]
+    lpt = logp_t[:, :-1, :]
+    ps = lps.exp()
+    pt = lpt.exp()
+    if kind == "rkl":
+        return (ps * (lps - lpt)).sum(dim=-1)
+    elif kind == "fkl":
+        return (pt * (lpt - lps)).sum(dim=-1)
+    else:
+        raise ValueError("kind must be rkl or fkl")
 
 def generate_continuations(
     model: PreTrainedModel,
@@ -155,14 +142,19 @@ def generate_continuations(
     top_p: float,
     micro_batch: int,
     show_progress: bool,
-) -> Tuple[torch.Tensor, List[int]]:
-    """Generate in micro-batches to cap peak memory."""
+) -> Tuple[torch.Tensor, List[int], int]:
+    """Generate in micro-batches; return CPU tensor to lower GPU peak.
+
+    Returns:
+        seq_std_cpu: torch.LongTensor [B, T] on CPU (right-padded to global max_T)
+        plen: List[int] prompt lengths per sample
+        pad_id: tokenizer pad id used for padding
+    """
     model_for_gen = getattr(model, "module", model)
     model_for_gen.eval()
-    # 收集原始输出，统一在循环结束后做全局长度对齐
     all_out_raw: List[torch.Tensor] = []
     all_plen: List[int] = []
-    max_T: int = 0
+    max_T = 0
     pad_id = tok.pad_token_id if getattr(tok, "pad_token_id", None) is not None else 0
     with torch.no_grad():
         iterator = range(0, len(prompts), max(1, micro_batch))
@@ -182,190 +174,137 @@ def generate_continuations(
                 pad_token_id=pad_id,
                 eos_token_id=tok.eos_token_id,
             )
-            # 跟踪全局最大序列长度
             max_T = max(max_T, gen.size(1))
-            # 记录每个样本的提示长度，用于续写掩码
-            pl = batch["input_ids"].ne(pad_id).sum(dim=1).tolist()
-            all_out_raw.append(gen)
-            all_plen.extend(pl)
+            all_out_raw.append(gen.detach())
+            all_plen.extend(batch["input_ids"].ne(pad_id).sum(dim=1).tolist())
             if bar is not None:
                 bar.update(len(chunk))
         if bar is not None:
             bar.close()
 
-    # 将所有微批的输出统一右侧填充到全局最大长度，以便拼接
     def pad_to(t: torch.Tensor, target_len: int, pad_token_id: int) -> torch.Tensor:
         if t.size(1) == target_len:
             return t
         if t.size(1) > target_len:
-            # 理论上不会发生，这里防御性截断
             return t[:, :target_len]
         pad_cols = target_len - t.size(1)
         pad = torch.full((t.size(0), pad_cols), pad_token_id, dtype=t.dtype, device=t.device)
         return torch.cat([t, pad], dim=1)
 
-    all_out: List[torch.Tensor] = [pad_to(t, max_T, pad_id) for t in all_out_raw]
-    return torch.cat(all_out, dim=0), all_plen
+    # Build one CPU tensor to minimize GPU residency
+    seq_std = torch.cat([pad_to(t, max_T, pad_id) for t in all_out_raw], dim=0).cpu()
+    return seq_std, all_plen, pad_id
 
 
-def logits_and_logprobs(
-    model: PreTrainedModel,
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-    micro_batch: int,
-    show_progress: bool,
-    desc: str,
-    use_cache: bool = True,  # 新增：是否使用 KV 缓存
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compute logits/logprobs in micro-batches along batch dimension."""
-    outs_l: List[torch.Tensor] = []
-    outs_lp: List[torch.Tensor] = []
-    iterator = range(0, input_ids.size(0), max(1, micro_batch))
-    bar = None
-    if show_progress and _HAVE_TQDM:
-        bar = tqdm(total=input_ids.size(0), desc=desc, leave=False, dynamic_ncols=True)
-    for i in iterator:
-        sl = slice(i, i + max(1, micro_batch))
-        logits = model(
-            input_ids=input_ids[sl],
-            attention_mask=attention_mask[sl],
-            use_cache=use_cache,  # 训练前向可选择关闭缓存
-        ).logits  # [b,T,V]
-        logp = nn.functional.log_softmax(logits, dim=-1)
-        outs_l.append(logits)
-        outs_lp.append(logp)
-        if bar is not None:
-            bar.update(input_ids[sl].size(0))
-    if bar is not None:
-        bar.close()
-    return torch.cat(outs_l, dim=0), torch.cat(outs_lp, dim=0)
-
-
-def per_position_exact_kl(logp_s: torch.Tensor, logp_t: torch.Tensor, kind: str) -> torch.Tensor:
-    """返回每个位置的 KL（不聚合），shape: [B, T-1]
-    kind: "rkl"(p_s||p_t) 或 "fkl"(p_t||p_s)。
-    计算时统一对齐 next-token 预测（移除最后一位）。
-    """
-    # 对齐：去掉最后一位的预测，目标为 input_ids[:,1:]
-    lps = logp_s[:, :-1, :]  # [B,T-1,V]
-    lpt = logp_t[:, :-1, :]
-    ps = lps.exp()
-    pt = lpt.exp()
-    if kind == "rkl":
-        # sum p_s * (log p_s - log p_t)
-        return (ps * (lps - lpt)).sum(dim=-1)
-    elif kind == "fkl":
-        # sum p_t * (log p_t - log p_s)
-        return (pt * (lpt - lps)).sum(dim=-1)
-    else:
-        raise ValueError("kind must be rkl or fkl")
-
-
-def per_position_mc_reverse(student_logp_gather: torch.Tensor, teacher_logp_gather: torch.Tensor) -> torch.Tensor:
-    """MC 近似的反向 KL：log p_s - log p_t（按被采样 token），shape [B, T-1]"""
-    return student_logp_gather - teacher_logp_gather
-
-
-def gather_logp_for_targets(logp: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
-    """从 logp[B,T,V] 按目标 token（input_ids[:,1:]）取出 logprob，得到 [B,T-1]"""
-    target_ids = input_ids[:, 1:]
-    return logp[:, :-1, :].gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
-
-
-def train_step(student: PreTrainedModel, teacher: PreTrainedModel, tok: PreTrainedTokenizerBase, prompts: List[str], cfg: Config, accelerator: Accelerator, optimizer: torch.optim.Optimizer) -> dict:
-    # 1) 学生 on-policy 采样
-    seq_std, plen = generate_continuations(
+def train_step(
+    student: PreTrainedModel,
+    teacher: PreTrainedModel,
+    tok: PreTrainedTokenizerBase,
+    prompts: List[str],
+    cfg: Config,
+    accelerator: Accelerator,
+    optimizer: torch.optim.Optimizer,
+) -> dict:
+    # 1) 学生 on-policy 生成（微批），结果存 CPU
+    seq_std_cpu, plen_s, pad_id = generate_continuations(
         student, tok, prompts,
         cfg.max_new_tokens, cfg.temperature, cfg.top_p,
         cfg.gen_micro_batch,
         cfg.progress and accelerator.is_main_process,
     )
-    am_std = seq_std.ne(tok.pad_token_id).long()
-
-    # 2) 学生与老师在学生序列上的分布
-    teacher.eval()
-    with torch.no_grad():
-        _, logp_t_std = logits_and_logprobs(
-            teacher, seq_std, am_std,
-            cfg.lp_micro_batch,
-            cfg.progress and accelerator.is_main_process,
-            desc="teacher lp",
-            # 教师保持默认 use_cache=True
-        )
-    student.train()
-    logit_s_std, logp_s_std = logits_and_logprobs(
-        student, seq_std, am_std,
-        cfg.lp_micro_batch,
-        cfg.progress and accelerator.is_main_process,
-        desc="student lp",
-        use_cache=False,  # 学生训练前向关闭缓存，降低显存峰值
-    )
-
-    # 3) 计算 per-position 反向 KL 指标 D_rkl（用于门控）
-    if cfg.rkl == "exact":
-        d_rkl = per_position_exact_kl(logp_s_std, logp_t_std, kind="rkl")  # [B,T-1]
-    elif cfg.rkl == "mc":
-        s_g = gather_logp_for_targets(logp_s_std, seq_std)
-        t_g = gather_logp_for_targets(logp_t_std, seq_std)
-        d_rkl = per_position_mc_reverse(s_g, t_g)
-    else:
-        raise ValueError("rkl should be exact|mc")
-
-    # 4) 构造续写掩码
-    B, Tm1 = d_rkl.shape
-    cont_mask = torch.zeros_like(d_rkl, dtype=torch.bool)
-    for i, L in enumerate(plen):
+    # 2) 构造有效掩码（续写且非 pad）与 token 计数（基于学生序列；教师采样在同一上下文逐位进行）
+    B_s, T_s = seq_std_cpu.size()
+    am_s_cpu = seq_std_cpu.ne(pad_id)
+    cont_s = torch.zeros((B_s, max(T_s - 1, 0)), dtype=torch.bool)
+    for i, L in enumerate(plen_s):
         start = max(L - 1, 0)
-        cont_mask[i, start:] = True
+        if T_s > 1:
+            cont_s[i, start:] = True
+    valid_s_cpu = cont_s & am_s_cpu[:, 1:]
+    tokens_s = int(valid_s_cpu.sum().item())
+    if tokens_s == 0:
+        return {"loss": 0.0, "lambda": 0.0, "rkl_metric": 0.0, "tokens": 0}
 
-    # 5) 计算 RKL 与 FKL 的逐位损失
-    # RKL：exact 使用 per_position_exact_kl("rkl")；MC 使用 -(A*log p_s) 等价项
-    if cfg.rkl == "exact":
-        rkl_pos = per_position_exact_kl(logp_s_std, logp_t_std, kind="rkl")  # [B,T-1]
-        rkl_loss_pos = rkl_pos  # 已是 KL 值
-    else:
-        # MC：A = -coef*(log p_s - log p_t)，loss = -A*log p_s = coef*(log p_s - log p_t)*log p_s
-        # 这里直接用 -(log p_s - log p_t) * log p_s（不乘 coef，coef 可并入门控/权重），保持与 on-policy 一致的梯度方向
-        s_g = gather_logp_for_targets(logp_s_std, seq_std)
-        t_g = gather_logp_for_targets(logp_t_std, seq_std)
-        adv = -(s_g - t_g)
-        rkl_loss_pos = -adv * s_g  # [B,T-1]
+    teacher.eval()
+    student.train()
+    mb = max(1, cfg.lp_micro_batch)
 
-    # FKL：full=全词表期望；argmax=老师 argmax token 的 CE
-    if cfg.fkl == "full":
-        # 对齐到 [B, T-1]：截掉最后一位的 next-token 预测，再做 p_T * log p_S 的期望
-        ce_pos = -(logp_t_std[:, :-1, :].exp() * logp_s_std[:, :-1, :]).sum(dim=-1)  # [B,T-1]
-        fkl_loss_pos = ce_pos
-    elif cfg.fkl == "argmax":
-        with torch.no_grad():
-            tgt_ids = logp_t_std.argmax(dim=-1)  # [B,T]
-        ce = nn.functional.nll_loss(logp_s_std[:, :-1, :].permute(0, 2, 1), tgt_ids[:, 1:], reduction="none")  # [B,T-1]
-        fkl_loss_pos = ce
-    else:
-        raise ValueError("fkl should be full|argmax")
+    # 3) 单次前向复用：每个微批只计算一次 student/teacher，再得到 rKL、MC-FKL 与 gating，并立即反向
+    eps = 1e-8
+    d_rkl_sum = torch.tensor(0.0, device=accelerator.device)
+    d_fkl_sum = torch.tensor(0.0, device=accelerator.device)
+    tokens_accum = torch.tensor(0.0, device=accelerator.device)
+    loss_sum = torch.tensor(0.0, device=accelerator.device)
+    gR_sum = torch.tensor(0.0, device=accelerator.device)
+    gF_sum = torch.tensor(0.0, device=accelerator.device)
 
-    # 6) 门控权重 λ_t
-    if cfg.gating == "soft":
-        lam = torch.sigmoid(cfg.alpha * (cfg.tau - d_rkl))  # [B,T-1]
-    elif cfg.gating == "hard":
-        lam = (d_rkl < cfg.tau).float()
-    else:
-        raise ValueError("gating should be soft|hard")
+    for i in range(0, B_s, mb):
+        sl = slice(i, i + mb)
+        ids_mb = seq_std_cpu[sl].to(accelerator.device, non_blocking=True)
+        attn_mb = ids_mb.ne(pad_id).long()
+        valid_mb = (cont_s[sl].to(accelerator.device)) & attn_mb[:, 1:].bool()
+        with accelerator.autocast():
+            with torch.no_grad():
+                logits_t = teacher(input_ids=ids_mb, attention_mask=attn_mb, use_cache=True).logits
+                logp_t = nn.functional.log_softmax(logits_t, dim=-1)
+                del logits_t
+            logits_s = student(input_ids=ids_mb, attention_mask=attn_mb, use_cache=False).logits
+            logp_s = nn.functional.log_softmax(logits_s, dim=-1)
+            del logits_s
+        # rKL-MC（学生 token）与 gating g_R（无梯度）
+        s_g_s = logp_s[:, :-1, :].gather(-1, ids_mb[:, 1:].unsqueeze(-1)).squeeze(-1)
+        t_g_s = logp_t[:, :-1, :].gather(-1, ids_mb[:, 1:].unsqueeze(-1)).squeeze(-1)
+        d_rkl_mb = (s_g_s - t_g_s).detach()
+        rkl_loss_pos = d_rkl_mb * s_g_s
+        gR_mb = torch.relu(d_rkl_mb * s_g_s).masked_select(valid_mb).sum().detach()
 
-    # 7) 合成逐位损失并聚合
-    loss_pos = lam * rkl_loss_pos + (1.0 - lam) * fkl_loss_pos
-    # 仅在有效 token（续写且非 pad）位置聚合
-    valid_mask = cont_mask & am_std[:, 1:].bool()
-    loss = loss_pos.masked_select(valid_mask).mean()
+        # fKL-MC：逐位从教师分布采样 token（同一上下文），并计算 gating g_F
+        probs_t = logp_t[:, :-1, :].exp()
+        Bm, Lm, V = probs_t.shape
+        sampled = torch.multinomial(probs_t.reshape(-1, V), num_samples=1).reshape(Bm, Lm)
+        t_g_t = logp_t[:, :-1, :].gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
+        s_g_t = logp_s[:, :-1, :].gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
+        d_fkl_mb = (t_g_t - s_g_t).detach()
+        fkl_loss_pos = - s_g_t
+        gF_mb = torch.relu(d_fkl_mb* t_g_t).masked_select(valid_mb).sum().detach()
 
-    accelerator.backward(loss)
+        # 本微批的对称 gating 标量（无梯度）
+        denom_mb = gR_mb + gF_mb + eps
+        lam_R_mb = (gR_mb / denom_mb) if denom_mb.item() > 0 else torch.tensor(0.5, device=accelerator.device)
+        lam_F_mb = (gF_mb / denom_mb) if denom_mb.item() > 0 else torch.tensor(0.5, device=accelerator.device)
 
-    # 指标（跨进程聚合）
-    lam_mean = accelerator.gather_for_metrics(lam.masked_select(valid_mask).detach()).mean().item()
-    d_rkl_mean = accelerator.gather_for_metrics(d_rkl.masked_select(valid_mask).detach()).mean().item()
-    loss_val = accelerator.gather_for_metrics(loss.detach()).mean().item()
-    tokens = accelerator.gather_for_metrics(valid_mask.sum().detach()).sum().item()
-    return {"loss": float(loss_val), "lambda": float(lam_mean), "rkl_metric": float(d_rkl_mean), "tokens": int(tokens)}
+        # 汇总损失（按整批学生有效 token 数归一化），并反向
+        loss_pos_mb = lam_R_mb * rkl_loss_pos + lam_F_mb * fkl_loss_pos
+        loss_mb = loss_pos_mb.masked_select(valid_mb).sum() / float(max(1, tokens_s))
+        is_last = (i + mb) >= B_s
+        if not is_last:
+            with accelerator.no_sync(student):
+                accelerator.backward(loss_mb)
+        else:
+            accelerator.backward(loss_mb)
+        # 指标与 gating 累计（使用无梯度量）
+        d_rkl_sum = d_rkl_sum + d_rkl_mb.masked_select(valid_mb).sum()
+        d_fkl_sum = d_fkl_sum + d_fkl_mb.masked_select(valid_mb).sum()
+        tokens_accum = tokens_accum + valid_mb.sum()
+        loss_sum = loss_sum + loss_mb.detach()
+        gR_sum = gR_sum + gR_mb
+        gF_sum = gF_sum + gF_mb
+        del ids_mb, attn_mb, valid_mb, logp_t, logp_s, s_g_s, t_g_s, d_rkl_mb, rkl_loss_pos, probs_t, sampled, t_g_t, s_g_t, fkl_loss_pos, loss_mb
+
+    # 跨进程聚合指标（lambda 取 lam_R，rkl_metric 取学生序列上的均值）
+    rkl_mean = (
+        accelerator.gather_for_metrics(d_rkl_sum).sum() / accelerator.gather_for_metrics(tokens_accum).sum().clamp_min(1)
+    ).item()
+    fkl_mean = (
+        accelerator.gather_for_metrics(d_fkl_sum).sum() / accelerator.gather_for_metrics(tokens_accum).sum().clamp_min(1)
+    ).item()
+    # 全局 lambda 基于累计的 gR/gF 归一化
+    gR_all = accelerator.gather_for_metrics(gR_sum).sum()
+    gF_all = accelerator.gather_for_metrics(gF_sum).sum()
+    lam_value = (gR_all / (gR_all + gF_all + eps)).item() if (gR_all + gF_all).item() > 0 else 0.5
+    tokens = int(accelerator.gather_for_metrics(tokens_accum).sum().item())
+    loss_val = accelerator.gather_for_metrics(loss_sum).mean().item()
+    return {"loss": float(loss_val), "lambda": float(lam_value), "rkl_metric": float(rkl_mean), "fkl_metric": float(fkl_mean), "tokens": tokens}
 
 
 def main(cfg: Config) -> None:
@@ -379,12 +318,10 @@ def main(cfg: Config) -> None:
             os.environ["WANDB_MODE"] = cfg.wandb_mode
         accelerator.init_trackers(cfg.wandb_project, config=vars(cfg), init_kwargs={"wandb": {"name": cfg.wandb_name}})
 
-    # 模型与分词器
     torch_dtype = torch.bfloat16 if cfg.dtype.lower() == "bf16" else torch.float16 if cfg.dtype.lower() == "fp16" else None
     student = AutoModelForCausalLM.from_pretrained(cfg.student_model, dtype=torch_dtype if torch_dtype else None)
     teacher = AutoModelForCausalLM.from_pretrained(cfg.teacher_model, dtype=torch_dtype if torch_dtype else None)
     tok = AutoTokenizer.from_pretrained(cfg.student_model)
-    # decoder-only models prefer left padding for generation efficiency
     try:
         if getattr(tok, "pad_token_id", None) is not None:
             tok.padding_side = "left"
@@ -392,7 +329,6 @@ def main(cfg: Config) -> None:
         pass
     ensure_pad_token(tok)
 
-    # LoRA（可选）
     if cfg.use_lora:
         if not PEFT_AVAILABLE:
             raise RuntimeError("peft 未安装，请先 pip install peft")
@@ -401,9 +337,8 @@ def main(cfg: Config) -> None:
         student = get_peft_model(student, lora_cfg)
 
     optimizer = AdamW(student.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
-    # Prepare student with Accelerator; keep teacher out to avoid DDP replication
     student, optimizer = accelerator.prepare(student, optimizer)
-    # Teacher: inference only, ZeRO-3 sharded if enabled
+
     for p in teacher.parameters():
         p.requires_grad_(False)
     if cfg.teacher_ds_zero3:
@@ -423,16 +358,11 @@ def main(cfg: Config) -> None:
                 "stage3_gather_16bit_weights_on_model_save": False,
             },
         }
-        if cfg.teacher_ds_config and os.path.exists(cfg.teacher_ds_config):
-            import json
-            with open(cfg.teacher_ds_config, "r") as f:
-                ds_cfg = json.load(f)
         teacher, _, _, _ = deepspeed.initialize(model=teacher, model_parameters=None, config=ds_cfg)
 
     prompts = get_prompts(cfg)
     step = 0
     while step < cfg.steps:
-        # 轮转取 batch，并按进程切分
         start = (step * cfg.batch_size) % max(1, len(prompts))
         end = start + cfg.batch_size
         groups = prompts[start:end] if end <= len(prompts) else (prompts[start:] + prompts[: (end % len(prompts))])
@@ -452,12 +382,69 @@ def main(cfg: Config) -> None:
         step += 1
 
         if accelerator.is_main_process and (step % 10 == 0 or step == 1):
-            accelerator.print(f"step {step:05d} | loss={metrics['loss']:.4f} λ={metrics['lambda']:.3f} rkl={metrics['rkl_metric']:.4f} tokens={metrics['tokens']}")
+            accelerator.print(
+                f"step {step:05d} | loss={metrics['loss']:.4f} λ={metrics['lambda']:.3f} rkl={metrics['rkl_metric']:.4f} fkl={metrics.get('fkl_metric', 0.0):.4f} tokens={metrics['tokens']}"
+            )
         if cfg.wandb_project:
-            accelerator.log({"train/loss": metrics["loss"], "train/lambda": metrics["lambda"], "train/rkl_metric": metrics["rkl_metric"], "train/tokens": metrics["tokens"], "train/step": step}, step=step)
+            accelerator.log({
+                "train/loss": metrics["loss"],
+                "train/lambda": metrics["lambda"],
+                "train/rkl_metric": metrics["rkl_metric"],
+                "train/fkl_metric": metrics.get("fkl_metric", 0.0),
+                "train/tokens": metrics["tokens"],
+                "train/step": step,
+            }, step=step)
 
-        if accelerator.is_main_process and cfg.eval_every > 0 and step % cfg.eval_every == 0:
-            accelerator.print("(提示) 可在此处添加更完整的评估逻辑，例如固定 prompt 子集的 post-KL 估计。")
+        # Exact KL eval on a small subset
+        if cfg.eval_every > 0 and step % cfg.eval_every == 0:
+            with torch.no_grad():
+                k = min(4, len(prompts))
+                eval_prompts = prompts[-k:]
+                seqs_cpu, plens, pad_id = generate_continuations(
+                    student, tok, eval_prompts,
+                    cfg.max_new_tokens, cfg.temperature, cfg.top_p,
+                    cfg.gen_micro_batch,
+                    cfg.progress and accelerator.is_main_process,
+                )
+                r_sum = torch.tensor(0.0, device=accelerator.device)
+                f_sum = torch.tensor(0.0, device=accelerator.device)
+                t_sum = torch.tensor(0.0, device=accelerator.device)
+                it_eval = range(0, seqs_cpu.size(0), max(1, cfg.lp_micro_batch))
+                for i_eval in it_eval:
+                    sl = slice(i_eval, i_eval + max(1, cfg.lp_micro_batch))
+                    ids_mb = seqs_cpu[sl].to(accelerator.device, non_blocking=True)
+                    am_mb = ids_mb.ne(pad_id).long()
+                    with accelerator.autocast():
+                        logits_s = student(input_ids=ids_mb, attention_mask=am_mb, use_cache=False).logits
+                        logits_t = teacher(input_ids=ids_mb, attention_mask=am_mb, use_cache=True).logits
+                        logp_s = nn.functional.log_softmax(logits_s, dim=-1)
+                        logp_t = nn.functional.log_softmax(logits_t, dim=-1)
+                    # per-position exact KL
+                    r_pos = per_position_exact_kl(logp_s, logp_t, kind="rkl")
+                    f_pos = per_position_exact_kl(logp_s, logp_t, kind="fkl")
+                    # valid mask: continuation and non-pad
+                    cont_mb = torch.zeros_like(r_pos, dtype=torch.bool)
+                    for j, L in enumerate(plens[sl]):
+                        start_j = max(L - 1, 0)
+                        cont_mb[j, start_j:] = True
+                    valid_mb = cont_mb & am_mb[:, 1:].bool()
+                    r_sum = r_sum + r_pos.masked_select(valid_mb).sum()
+                    f_sum = f_sum + f_pos.masked_select(valid_mb).sum()
+                    t_sum = t_sum + valid_mb.sum()
+                # aggregate across ranks
+                r_all = accelerator.gather_for_metrics(r_sum).sum()
+                f_all = accelerator.gather_for_metrics(f_sum).sum()
+                t_all = accelerator.gather_for_metrics(t_sum).sum()
+                rkl_exact = (r_all / t_all).item() if t_all.item() > 0 else 0.0
+                fkl_exact = (f_all / t_all).item() if t_all.item() > 0 else 0.0
+                if accelerator.is_main_process:
+                    accelerator.print(f"eval rkl_exact={rkl_exact:.4f} fkl_exact={fkl_exact:.4f}")
+                if cfg.wandb_project:
+                    accelerator.log({
+                        "eval/rkl_exact": rkl_exact,
+                        "eval/fkl_exact": fkl_exact,
+                        "train/step": step,
+                    }, step=step)
 
         if accelerator.is_main_process and cfg.save_every > 0 and step % cfg.save_every == 0:
             ckpt_dir = os.path.join(cfg.output_dir, f"step-{step}")
@@ -475,7 +462,7 @@ def main(cfg: Config) -> None:
 
 
 def parse_args() -> Config:
-    p = argparse.ArgumentParser(description="Dual-KL 蒸馏（正向+反向 KL）")
+    p = argparse.ArgumentParser(description="Dual-KL 微批反向（正向+反向 KL）")
     p.add_argument("--student_model", type=str, required=True)
     p.add_argument("--teacher_model", type=str, required=True)
     p.add_argument("--output_dir", type=str, default="./dual-kl-out")
@@ -487,13 +474,7 @@ def parse_args() -> Config:
     p.add_argument("--top_p", type=float, default=0.95)
     p.add_argument("--learning_rate", type=float, default=5e-5)
     p.add_argument("--weight_decay", type=float, default=0.0)
-    # Dual KL
-    p.add_argument("--tau", type=float, default=1.0)
-    p.add_argument("--alpha", type=float, default=5.0)
-    p.add_argument("--gating", type=str, default="soft", choices=["soft", "hard"])
-    p.add_argument("--rkl", type=str, default="exact", choices=["exact", "mc"])
-    p.add_argument("--fkl", type=str, default="full", choices=["full", "argmax"])
-    # misc
+    # rKL/fKL 均为 MC 实现，无需额外开关
     p.add_argument("--save_every", type=int, default=100)
     p.add_argument("--prompts_file", type=str, default=None)
     p.add_argument("--dataset", type=str, default=None)
@@ -509,11 +490,11 @@ def parse_args() -> Config:
     p.add_argument("--wandb_project", type=str, default=None)
     p.add_argument("--wandb_name", type=str, default=None)
     p.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline", "disabled"])
-    p.add_argument("--teacher_ds_zero3", action="store_true", help="使用 DeepSpeed ZeRO-3 对 teacher 做推理分片")
-    p.add_argument("--teacher_ds_config", type=str, default=None, help="DeepSpeed 配置文件（可选）")
-    p.add_argument("--gen_micro_batch", type=int, default=8, help="生成阶段的微批大小")
-    p.add_argument("--lp_micro_batch", type=int, default=8, help="logprob 前向计算的微批大小")
-    p.add_argument("--no_progress", action="store_true", help="关闭进度条显示（默认开启，仅主进程显示）")
+    p.add_argument("--teacher_ds_zero3", action="store_true")
+    p.add_argument("--teacher_ds_config", type=str, default=None)
+    p.add_argument("--gen_micro_batch", type=int, default=8)
+    p.add_argument("--lp_micro_batch", type=int, default=8)
+    p.add_argument("--no_progress", action="store_true")
     a = p.parse_args()
     return Config(
         student_model=a.student_model,
@@ -527,11 +508,6 @@ def parse_args() -> Config:
         top_p=a.top_p,
         learning_rate=a.learning_rate,
         weight_decay=a.weight_decay,
-        tau=a.tau,
-        alpha=a.alpha,
-        gating=a.gating,
-        rkl=a.rkl,
-        fkl=a.fkl,
         save_every=a.save_every,
         prompts_file=a.prompts_file,
         dataset=a.dataset,

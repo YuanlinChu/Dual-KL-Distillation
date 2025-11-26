@@ -58,7 +58,7 @@ class Config:
     lora_dropout: float = 0.05
     dtype: str = "bf16"  # bf16|fp16|fp32
     grad_accum: int = 1  # like num_substeps
-    eval_every: int = 100
+    eval_every: int = 50
     dataset: str | None = None  # deepmath|tulu3|None
     max_prompt_tokens: int | None = None
     wandb_project: str | None = None
@@ -134,6 +134,25 @@ def truncate_by_tokens(tokenizer: PreTrainedTokenizerBase, text: str, max_tokens
         return text
     ids = ids[:max_tokens]
     return tokenizer.decode(ids)
+
+
+def per_position_exact_kl(logp_s: torch.Tensor, logp_t: torch.Tensor, kind: str) -> torch.Tensor:
+    """逐位置精确 KL（不聚合），返回 [B, T-1]
+
+    kind="rkl": KL(p_s || p_t) = sum_v p_s(v)*(log p_s - log p_t)
+    kind="fkl": KL(p_t || p_s) = sum_v p_t(v)*(log p_t - log p_s)
+    与 next-token 对齐：去掉最后一位预测。
+    """
+    lps = logp_s[:, :-1, :]
+    lpt = logp_t[:, :-1, :]
+    ps = lps.exp()
+    pt = lpt.exp()
+    if kind == "rkl":
+        return (ps * (lps - lpt)).sum(dim=-1)
+    elif kind == "fkl":
+        return (pt * (lpt - lps)).sum(dim=-1)
+    else:
+        raise ValueError("kind must be rkl or fkl")
 
 
 def ensure_pad_token(tokenizer: PreTrainedTokenizerBase) -> None:
@@ -316,7 +335,7 @@ def train_step(
         # 反向 KL 的 MC 优势（detach），可选时序折扣
         s_g_mb = logp_s_mb[:, :-1, :].gather(-1, ids_mb[:, 1:].unsqueeze(-1)).squeeze(-1)
         t_g_mb = logp_t_mb[:, :-1, :].gather(-1, ids_mb[:, 1:].unsqueeze(-1)).squeeze(-1)
-        d_rkl_mb = (s_g_mb.detach() - t_g_mb)  # 仅作指标/门控
+        d_rkl_mb = (s_g_mb.detach() - t_g_mb)  # 仅作指标
         adv_mb = -(s_g_mb - t_g_mb).detach() * cfg.kl_coef
         if cfg.kl_discount > 0:
             adv_mb = discounted_future_sum(adv_mb, cfg.kl_discount)
@@ -475,47 +494,50 @@ def main(cfg: Config) -> None:
             accelerator.log({"train/loss": metrics["loss"], "train/reverse_kl": metrics["reverse_kl"], "train/tokens": metrics["tokens"], "train/step": step}, step=step)
 
         if cfg.eval_every > 0 and step % cfg.eval_every == 0:
-            # 在所有进程上执行 eval，避免 ZeRO-3 教师引发的分布式阻塞；只在主进程打印
+            # 在所有进程上执行 exact KL eval；只在主进程打印
             with torch.no_grad():
-                eval_prompts = prompts[: min(4, len(prompts))]
-                seqs_cpu, plens, pad_id = generate_continuations(
-                    student, tokenizer, eval_prompts,
-                    cfg.max_new_tokens, cfg.temperature, cfg.top_p,
-                    cfg.gen_micro_batch,
-                    cfg.progress and accelerator.is_main_process,
-                )
-                # 计算 MC 反向 KL 的均值（续写且非 pad），分布式聚合
-                d_sum = torch.tensor(0.0, device=accelerator.device)
-                tok_sum = torch.tensor(0.0, device=accelerator.device)
-                it_eval = range(0, seqs_cpu.size(0), max(1, cfg.lp_micro_batch))
-                for i_eval in it_eval:
-                    sl = slice(i_eval, i_eval + max(1, cfg.lp_micro_batch))
-                    ids_mb = seqs_cpu[sl].to(accelerator.device, non_blocking=True)
-                    am_mb = ids_mb.ne(pad_id).long()
-                    with accelerator.autocast():
-                        # teacher 用 use_cache=True；student 用 use_cache=False
-                        logits_s = student(input_ids=ids_mb, attention_mask=am_mb, use_cache=False).logits
-                        logits_t = teacher(input_ids=ids_mb, attention_mask=am_mb, use_cache=True).logits
-                        logp_s = nn.functional.log_softmax(logits_s, dim=-1)
-                        logp_t = nn.functional.log_softmax(logits_t, dim=-1)
-                    s_g = logp_s[:, :-1, :].gather(-1, ids_mb[:, 1:].unsqueeze(-1)).squeeze(-1)
-                    t_g = logp_t[:, :-1, :].gather(-1, ids_mb[:, 1:].unsqueeze(-1)).squeeze(-1)
-                    # 有效掩码：续写且非 pad
-                    cont_mask = torch.zeros_like(s_g, dtype=torch.bool)
-                    for j, L in enumerate(plens[sl]):
-                        start_j = max(L - 1, 0)
-                        cont_mask[j, start_j:] = True
-                    valid_mask = cont_mask & am_mb[:, 1:].bool()
-                    d_sum = d_sum + (s_g - t_g).masked_select(valid_mask).sum()
-                    tok_sum = tok_sum + valid_mask.sum()
-                # 跨进程聚合
-                d_all = accelerator.gather_for_metrics(d_sum).sum()
-                t_all = accelerator.gather_for_metrics(tok_sum).sum()
-                rev_kl_eval = (d_all / t_all).item() if t_all.item() > 0 else 0.0
-                if accelerator.is_main_process:
-                    accelerator.print(f"eval reverse_kl={rev_kl_eval:.4f}")
-                if cfg.wandb_project:
-                    accelerator.log({"eval/reverse_kl": rev_kl_eval, "train/step": step}, step=step)
+                k = min(4, len(prompts))
+                eval_prompts = prompts[-k:] if k > 0 else []
+                if eval_prompts:
+                    seqs_cpu, plens, pad_id = generate_continuations(
+                        student, tokenizer, eval_prompts,
+                        cfg.max_new_tokens, cfg.temperature, cfg.top_p,
+                        cfg.gen_micro_batch,
+                        cfg.progress and accelerator.is_main_process,
+                    )
+                    r_sum = torch.tensor(0.0, device=accelerator.device)
+                    f_sum = torch.tensor(0.0, device=accelerator.device)
+                    t_sum = torch.tensor(0.0, device=accelerator.device)
+                    it_eval = range(0, seqs_cpu.size(0), max(1, cfg.lp_micro_batch))
+                    for i_eval in it_eval:
+                        sl = slice(i_eval, i_eval + max(1, cfg.lp_micro_batch))
+                        ids_mb = seqs_cpu[sl].to(accelerator.device, non_blocking=True)
+                        am_mb = ids_mb.ne(pad_id).long()
+                        with accelerator.autocast():
+                            logits_s = student(input_ids=ids_mb, attention_mask=am_mb, use_cache=False).logits
+                            logits_t = teacher(input_ids=ids_mb, attention_mask=am_mb, use_cache=True).logits
+                            logp_s = nn.functional.log_softmax(logits_s, dim=-1)
+                            logp_t = nn.functional.log_softmax(logits_t, dim=-1)
+                        # exact per-position KL
+                        r_pos = per_position_exact_kl(logp_s, logp_t, kind="rkl")
+                        f_pos = per_position_exact_kl(logp_s, logp_t, kind="fkl")
+                        cont_mask = torch.zeros_like(r_pos, dtype=torch.bool)
+                        for j, L in enumerate(plens[sl]):
+                            start_j = max(L - 1, 0)
+                            cont_mask[j, start_j:] = True
+                        valid_mask = cont_mask & am_mb[:, 1:].bool()
+                        r_sum = r_sum + r_pos.masked_select(valid_mask).sum()
+                        f_sum = f_sum + f_pos.masked_select(valid_mask).sum()
+                        t_sum = t_sum + valid_mask.sum()
+                    r_all = accelerator.gather_for_metrics(r_sum).sum()
+                    f_all = accelerator.gather_for_metrics(f_sum).sum()
+                    t_all = accelerator.gather_for_metrics(t_sum).sum()
+                    rkl_exact = (r_all / t_all).item() if t_all.item() > 0 else 0.0
+                    fkl_exact = (f_all / t_all).item() if t_all.item() > 0 else 0.0
+                    if accelerator.is_main_process:
+                        accelerator.print(f"eval rkl_exact={rkl_exact:.4f} fkl_exact={fkl_exact:.4f}")
+                    if cfg.wandb_project:
+                        accelerator.log({"eval/rkl_exact": rkl_exact, "eval/fkl_exact": fkl_exact, "train/step": step}, step=step)
 
         if accelerator.is_main_process and cfg.save_every > 0 and step % cfg.save_every == 0:
             ckpt_dir = os.path.join(cfg.output_dir, f"step-{step}")

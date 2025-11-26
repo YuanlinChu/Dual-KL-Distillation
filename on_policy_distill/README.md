@@ -17,14 +17,7 @@
 
    pip install torch transformers peft datasets accelerate wandb deepspeed
 
-2) CPU 小模型演示（玩具数据）：
-
-   python -m on_policy_distill.train_on_policy_local \
-     --student_model sshleifer/tiny-gpt2 \
-     --teacher_model sshleifer/tiny-gpt2 \
-     --steps 3 --batch_size 2 --max_new_tokens 16 --group_size 2
-
-3) 单机多卡（2×A800 或 4×A800）分布式训练（建议）：
+2) 单机多卡（2×A800 或 4×A800）分布式训练（建议）：
 
    # 2 卡（bf16），使用默认的 accelerate 配置
    accelerate launch --config_file on_policy_distill/accelerate_config_multi_gpu.yaml \
