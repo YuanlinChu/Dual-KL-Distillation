@@ -86,9 +86,24 @@ def load_prompts(path: str | None) -> List[str]:
         return [line.strip() for line in f if line.strip()]
 
 
+def load_deepmath_prompts() -> List[str] | None:
+    """Load DeepMath-103K questions from HF if available."""
+    try:
+        from datasets import load_dataset  # type: ignore
+
+        ds = load_dataset("zwhe99/DeepMath-103K", split="train")
+        return [row["question"] for row in ds]  # type: ignore
+    except Exception:
+        return None
+
+
 def get_prompts(cfg: Config) -> List[str]:
     if cfg.prompts_file:
         return load_prompts(cfg.prompts_file)
+    if cfg.dataset == "deepmath":
+        p = load_deepmath_prompts()
+        if p:
+            return p
     if cfg.dataset == "tulu3":
         try:
             from datasets import load_dataset  # type: ignore

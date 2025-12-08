@@ -12,6 +12,7 @@ from .tasks import (
     eval_aime_hf,
     eval_math500_hf,
 )
+from .dist import cleanup_distributed
 
 
 def parse_args() -> argparse.Namespace:
@@ -22,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"], help="Computation dtype")
     p.add_argument("--n_samples", type=int, default=None, help="Limit number of samples for quick eval")
     p.add_argument("--batch_size", type=int, default=8, help="Generation micro-batch size")
-    p.add_argument("--max_new_tokens", type=int, default=256)
+    p.add_argument("--max_new_tokens", type=int, default=1024)
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--top_p", type=float, default=0.95)
     p.add_argument("--save_outputs", type=str, default=None, help="Optional JSONL path to save per-sample outputs")
@@ -34,6 +35,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    # Initialize (optional) distributed for multi-GPU with torchrun
+    try:
+        from .dist import init_distributed
+        _ = init_distributed()
+    except Exception:
+        pass
+
     cfg = EvalConfig(
         model=args.model,
         base_model=args.base_model,
@@ -62,6 +70,9 @@ def main() -> None:
         raise ValueError(f"Unknown task: {args.task}")
 
     print(json.dumps(res, ensure_ascii=False))
+
+    # Ensure distributed teardown to avoid NCCL warning on exit
+    cleanup_distributed()
 
 
 if __name__ == "__main__":

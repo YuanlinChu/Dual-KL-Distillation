@@ -30,6 +30,7 @@ def load_model_and_tokenizer(
     model_or_adapter: str,
     base_model: Optional[str] = None,
     dtype: str = "bf16",
+    device: Optional[torch.device] = None,
 ) -> Tuple[PreTrainedModel, PreTrainedTokenizerBase]:
     """
     Load a CausalLM and tokenizer.
@@ -65,5 +66,10 @@ def load_model_and_tokenizer(
     except Exception:
         pass
     ensure_pad_token(tok)
+    # Move to device if provided
+    if device is not None:
+        try:
+            model.to(device)
+        except Exception:
+            pass
     return model, tok
-
