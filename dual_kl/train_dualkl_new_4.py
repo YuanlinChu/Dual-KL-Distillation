@@ -40,13 +40,6 @@ class Config:
     top_p: float = 0.95
     learning_rate: float = 5e-5
     weight_decay: float = 0.0
-    # Dual-KL
-    tau: float = 1.0
-    alpha: float = 5.0
-    gating: str = "soft"  # soft|hard
-    rkl: str = "exact"  # exact|mc
-    fkl: str = "full"  # full|argmax
-    # misc
     save_every: int = 100
     prompts_file: str | None = None
     dataset: str | None = None
@@ -70,6 +63,11 @@ class Config:
     lp_micro_batch: int = 8
     # Progress
     progress: bool = True
+    # Fixed weights (0..1); in this variant rKL is fixed to 1.0 during training
+    lam_r: float = 1.0
+    lam_f: float = 1.0
+    # Enable position-decayed fKL weight: pos_ratio = 1 - pos_in_seq / seq_len
+    fkl_pos_decay: bool = False
 
 
 def ensure_pad_token(tok: PreTrainedTokenizerBase) -> None:
@@ -93,9 +91,24 @@ def load_prompts(path: str | None) -> List[str]:
         return [line.strip() for line in f if line.strip()]
 
 
+def load_deepmath_prompts() -> List[str] | None:
+    """Load DeepMath-103K questions from HF if available."""
+    try:
+        from datasets import load_dataset  # type: ignore
+
+        ds = load_dataset("zwhe99/DeepMath-103K", split="train")
+        return [row["question"] for row in ds]  # type: ignore
+    except Exception:
+        return None
+
+
 def get_prompts(cfg: Config) -> List[str]:
     if cfg.prompts_file:
         return load_prompts(cfg.prompts_file)
+    if cfg.dataset == "deepmath":
+        p = load_deepmath_prompts()
+        if p:
+            return p
     if cfg.dataset == "tulu3":
         try:
             from datasets import load_dataset  # type: ignore
@@ -122,6 +135,23 @@ def truncate_by_tokens(tok: PreTrainedTokenizerBase, text: str, max_tokens: int)
     ids = ids[:max_tokens]
     return tok.decode(ids)
 
+def per_position_exact_kl(logp_s: torch.Tensor, logp_t: torch.Tensor, kind: str) -> torch.Tensor:
+    """Return per-position exact KL (no aggregation) with shape [B, T-1].
+
+    kind: "rkl" computes KL(p_s || p_t) = sum_v p_s(v)*(log p_s - log p_t)
+          "fkl" computes KL(p_t || p_s) = sum_v p_t(v)*(log p_t - log p_s)
+    Align to next-token prediction by dropping last time step.
+    """
+    lps = logp_s[:, :-1, :]
+    lpt = logp_t[:, :-1, :]
+    ps = lps.exp()
+    pt = lpt.exp()
+    if kind == "rkl":
+        return (ps * (lps - lpt)).sum(dim=-1)
+    elif kind == "fkl":
+        return (pt * (lpt - lps)).sum(dim=-1)
+    else:
+        raise ValueError("kind must be rkl or fkl")
 
 def generate_continuations(
     model: PreTrainedModel,
@@ -186,24 +216,6 @@ def generate_continuations(
     return seq_std, all_plen, pad_id
 
 
-def per_position_exact_kl(logp_s: torch.Tensor, logp_t: torch.Tensor, kind: str) -> torch.Tensor:
-    lps = logp_s[:, :-1, :]
-    lpt = logp_t[:, :-1, :]
-    ps = lps.exp()
-    pt = lpt.exp()
-    if kind == "rkl":
-        return (ps * (lps - lpt)).sum(dim=-1)
-    elif kind == "fkl":
-        return (pt * (lpt - lps)).sum(dim=-1)
-    else:
-        raise ValueError("kind must be rkl or fkl")
-
-
-def gather_logp_for_targets(logp: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
-    target_ids = input_ids[:, 1:]
-    return logp[:, :-1, :].gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
-
-
 def train_step(
     student: PreTrainedModel,
     teacher: PreTrainedModel,
@@ -214,121 +226,111 @@ def train_step(
     optimizer: torch.optim.Optimizer,
 ) -> dict:
     # 1) 学生 on-policy 生成（微批），结果存 CPU
-    seq_std_cpu, plen, pad_id = generate_continuations(
+    seq_std_cpu, plen_s, pad_id = generate_continuations(
         student, tok, prompts,
         cfg.max_new_tokens, cfg.temperature, cfg.top_p,
         cfg.gen_micro_batch,
         cfg.progress and accelerator.is_main_process,
     )
-
-    B, T = seq_std_cpu.size()
-    # 全批有效 mask（CPU 上计算）
-    am_full_cpu = seq_std_cpu.ne(pad_id)
-    cont_mask = torch.zeros((B, max(T - 1, 0)), dtype=torch.bool)
-    for i, L in enumerate(plen):
+    # 2) 构造有效掩码（续写且非 pad）与 token 计数（基于学生序列；教师采样在同一上下文逐位进行）
+    B_s, T_s = seq_std_cpu.size()
+    am_s_cpu = seq_std_cpu.ne(pad_id)
+    cont_s = torch.zeros((B_s, max(T_s - 1, 0)), dtype=torch.bool)
+    for i, L in enumerate(plen_s):
         start = max(L - 1, 0)
-        if T > 1:
-            cont_mask[i, start:] = True
-    valid_mask_full = cont_mask & am_full_cpu[:, 1:]
-    tokens_total = int(valid_mask_full.sum().item())
-    if tokens_total == 0:
+        if T_s > 1:
+            cont_s[i, start:] = True
+    valid_s_cpu = cont_s & am_s_cpu[:, 1:]
+    tokens_s = int(valid_s_cpu.sum().item())
+    if tokens_s == 0:
         return {"loss": 0.0, "lambda": 0.0, "rkl_metric": 0.0, "tokens": 0}
-
-    # 累计指标（仅标量）
-    lam_sum = torch.tensor(0.0, device=accelerator.device)
-    d_rkl_sum = torch.tensor(0.0, device=accelerator.device)
-    tokens_accum = torch.tensor(0.0, device=accelerator.device)
-    loss_sum = torch.tensor(0.0, device=accelerator.device)
 
     teacher.eval()
     student.train()
     mb = max(1, cfg.lp_micro_batch)
-    bar_lp = None
-    if cfg.progress and _HAVE_TQDM and accelerator.is_main_process:
-        bar_lp = tqdm(total=B, desc="lp/back", leave=False, dynamic_ncols=True)
 
-    for i in range(0, B, mb):
+    # 3) 单次前向复用：每个微批只计算一次 student/teacher，再得到 rKL、MC-FKL 与 gating，并立即反向
+    eps = 1e-8
+    d_rkl_sum = torch.tensor(0.0, device=accelerator.device)
+    d_fkl_sum = torch.tensor(0.0, device=accelerator.device)
+    tokens_accum = torch.tensor(0.0, device=accelerator.device)
+    loss_sum = torch.tensor(0.0, device=accelerator.device)
+    # Using fixed lambda; no gating accumulation needed
+
+    for i in range(0, B_s, mb):
         sl = slice(i, i + mb)
-        # 将当前切片搬上 GPU
-        input_ids_mb = seq_std_cpu[sl].to(accelerator.device, non_blocking=True)
-        attn_mb = input_ids_mb.ne(pad_id).long()
-        valid_mask_mb = (cont_mask[sl].to(accelerator.device)) & attn_mb[:, 1:].bool()
-
-        # 教师/学生前向（自动混合精度）
+        ids_mb = seq_std_cpu[sl].to(accelerator.device, non_blocking=True)
+        attn_mb = ids_mb.ne(pad_id).long()
+        valid_mb = (cont_s[sl].to(accelerator.device)) & attn_mb[:, 1:].bool()
         with accelerator.autocast():
             with torch.no_grad():
-                logits_t = teacher(input_ids=input_ids_mb, attention_mask=attn_mb, use_cache=True).logits
-                logp_t_mb = nn.functional.log_softmax(logits_t, dim=-1)
-            logits_s = student(input_ids=input_ids_mb, attention_mask=attn_mb, use_cache=False).logits
-            logp_s_mb = nn.functional.log_softmax(logits_s, dim=-1)
-        del logits_t, logits_s
+                logits_t = teacher(input_ids=ids_mb, attention_mask=attn_mb, use_cache=True).logits
+                logp_t = nn.functional.log_softmax(logits_t, dim=-1)
+                del logits_t
+            logits_s = student(input_ids=ids_mb, attention_mask=attn_mb, use_cache=False).logits
+            logp_s = nn.functional.log_softmax(logits_s, dim=-1)
+            del logits_s
+        # rKL-MC（学生 token）
+        s_g_s = logp_s[:, :-1, :].gather(-1, ids_mb[:, 1:].unsqueeze(-1)).squeeze(-1)
+        t_g_s = logp_t[:, :-1, :].gather(-1, ids_mb[:, 1:].unsqueeze(-1)).squeeze(-1)
+        d_rkl_mb = (s_g_s - t_g_s).detach()
+        rkl_loss_pos = d_rkl_mb * s_g_s
 
-        # rKL 指标
-        if cfg.rkl == "exact":
-            d_rkl_mb = per_position_exact_kl(logp_s_mb, logp_t_mb, kind="rkl")  # [mb,T-1]
-            rkl_loss_pos = d_rkl_mb
-        elif cfg.rkl == "mc":
-            s_g_mb = gather_logp_for_targets(logp_s_mb, input_ids_mb)
-            t_g_mb = gather_logp_for_targets(logp_t_mb, input_ids_mb)
-            d_rkl_mb = s_g_mb.detach() - t_g_mb
-            adv_mb = -(s_g_mb - t_g_mb)
-            rkl_loss_pos = -adv_mb * s_g_mb
-        else:
-            raise ValueError("rkl should be exact|mc")
+        # fKL-MC：逐位从教师分布采样 token（同一上下文）
+        probs_t = logp_t[:, :-1, :].exp()
+        Bm, Lm, V = probs_t.shape
+        sampled = torch.multinomial(probs_t.reshape(-1, V), num_samples=1).reshape(Bm, Lm)
+        t_g_t = logp_t[:, :-1, :].gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
+        s_g_t = logp_s[:, :-1, :].gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
+        # Advantage for fKL: only penalize when teacher prob > student prob
+        d_fkl_raw = (t_g_t - s_g_t).detach()
+        d_fkl_mb = torch.relu(d_fkl_raw)
+        fkl_loss_pos = - d_fkl_mb * s_g_t
 
-        # FKL 逐位
-        if cfg.fkl == "full":
-            fkl_loss_pos = -(logp_t_mb[:, :-1, :].exp() * logp_s_mb[:, :-1, :]).sum(dim=-1)
-        elif cfg.fkl == "argmax":
-            with torch.no_grad():
-                tgt_ids_mb = logp_t_mb.argmax(dim=-1)
-            fkl_loss_pos = nn.functional.nll_loss(
-                logp_s_mb[:, :-1, :].permute(0, 2, 1), tgt_ids_mb[:, 1:], reduction="none"
-            )
-        else:
-            raise ValueError("fkl should be full|argmax")
+        # Position-decayed weight for fKL (optional)
+        if cfg.fkl_pos_decay:
+            # pos_in_seq counts from the first generated token (after prompt)
+            # start positions per sample (prompt length - 1)
+            starts = torch.tensor([max(L - 1, 0) for L in plen_s[sl]], device=accelerator.device, dtype=torch.long)
+            pos_idx = torch.arange(Lm, device=accelerator.device).unsqueeze(0).expand(Bm, Lm) - starts.unsqueeze(1)
+            pos_idx = torch.clamp_min(pos_idx, 0)
+            seq_len = torch.clamp(Lm - starts, min=1)
+            pos_ratio = 1.0 - (pos_idx.float() / seq_len.unsqueeze(1).float())
+            pos_ratio = torch.clamp(pos_ratio, 0.0, 1.0)
+            fkl_loss_pos = fkl_loss_pos * pos_ratio
 
-        # 门控（对 d_rkl 断开梯度，稳定训练）
-        if cfg.gating == "soft":
-            lam_mb = torch.sigmoid(cfg.alpha * (cfg.tau - d_rkl_mb.detach()))
-        elif cfg.gating == "hard":
-            lam_mb = (d_rkl_mb.detach() < cfg.tau).float()
-        else:
-            raise ValueError("gating should be soft|hard")
+        # Fixed weights: rKL=1.0; fKL default 1.0 (subject to optional decay above)
+        lam_R_mb = torch.tensor(1.0, device=accelerator.device)
+        lam_F_mb = torch.tensor(float(max(0.0, min(1.0, cfg.lam_f))), device=accelerator.device)
 
-        loss_pos_mb = lam_mb * rkl_loss_pos + (1.0 - lam_mb) * fkl_loss_pos
-        # 归一化到整批 token 数，保持各片梯度等价于整批 mean
-        loss_mb = loss_pos_mb.masked_select(valid_mask_mb).sum() / float(tokens_total)
-
-        # 仅最后一片同步 allreduce，降低 DDP 开销
-        is_last = (i + mb) >= B
+        # 汇总损失（按整批学生有效 token 数归一化），并反向
+        loss_pos_mb = lam_R_mb * rkl_loss_pos + lam_F_mb * fkl_loss_pos
+        loss_mb = loss_pos_mb.masked_select(valid_mb).sum() / float(max(1, tokens_s))
+        is_last = (i + mb) >= B_s
         if not is_last:
             with accelerator.no_sync(student):
                 accelerator.backward(loss_mb)
         else:
             accelerator.backward(loss_mb)
-
-        # 指标累计
-        lam_sum = lam_sum + lam_mb.masked_select(valid_mask_mb).detach().sum()
-        d_rkl_sum = d_rkl_sum + d_rkl_mb.masked_select(valid_mask_mb).detach().sum()
-        tokens_accum = tokens_accum + valid_mask_mb.sum().detach()
+        # 指标与 gating 累计（使用无梯度量）
+        d_rkl_sum = d_rkl_sum + d_rkl_mb.masked_select(valid_mb).sum()
+        d_fkl_sum = d_fkl_sum + d_fkl_mb.masked_select(valid_mb).sum()
+        tokens_accum = tokens_accum + valid_mb.sum()
         loss_sum = loss_sum + loss_mb.detach()
+        del ids_mb, attn_mb, valid_mb, logp_t, logp_s, s_g_s, t_g_s, d_rkl_mb, rkl_loss_pos, probs_t, sampled, t_g_t, s_g_t, fkl_loss_pos, loss_mb
 
-        if bar_lp is not None:
-            bar_lp.update(input_ids_mb.size(0))
-
-        # 释放切片张量
-        del input_ids_mb, attn_mb, valid_mask_mb, logp_t_mb, logp_s_mb, loss_pos_mb, loss_mb, lam_mb, d_rkl_mb
-
-    if bar_lp is not None:
-        bar_lp.close()
-
-    # 跨进程聚合指标
-    lam_mean = (accelerator.gather_for_metrics(lam_sum).sum() / accelerator.gather_for_metrics(tokens_accum).sum()).item()
-    d_rkl_mean = (accelerator.gather_for_metrics(d_rkl_sum).sum() / accelerator.gather_for_metrics(tokens_accum).sum()).item()
+    # 跨进程聚合指标（lambda 取 lam_R，rkl_metric 取学生序列上的均值）
+    rkl_mean = (
+        accelerator.gather_for_metrics(d_rkl_sum).sum() / accelerator.gather_for_metrics(tokens_accum).sum().clamp_min(1)
+    ).item()
+    fkl_mean = (
+        accelerator.gather_for_metrics(d_fkl_sum).sum() / accelerator.gather_for_metrics(tokens_accum).sum().clamp_min(1)
+    ).item()
+    # 直接报告固定 lambda（此处固定为 1.0）
+    lam_value = 1.0
     tokens = int(accelerator.gather_for_metrics(tokens_accum).sum().item())
     loss_val = accelerator.gather_for_metrics(loss_sum).mean().item()
-    return {"loss": float(loss_val), "lambda": float(lam_mean), "rkl_metric": float(d_rkl_mean), "tokens": tokens}
+    return {"loss": float(loss_val), "lambda": float(lam_value), "rkl_metric": float(rkl_mean), "fkl_metric": float(fkl_mean), "tokens": tokens}
 
 
 def main(cfg: Config) -> None:
@@ -407,16 +409,67 @@ def main(cfg: Config) -> None:
 
         if accelerator.is_main_process and (step % 10 == 0 or step == 1):
             accelerator.print(
-                f"step {step:05d} | loss={metrics['loss']:.4f} λ={metrics['lambda']:.3f} rkl={metrics['rkl_metric']:.4f} tokens={metrics['tokens']}"
+                f"step {step:05d} | loss={metrics['loss']:.4f} rkl={metrics['rkl_metric']:.4f} d_fkl={metrics.get('fkl_metric', 0.0):.4f} tokens={metrics['tokens']}"
             )
         if cfg.wandb_project:
             accelerator.log({
                 "train/loss": metrics["loss"],
-                "train/lambda": metrics["lambda"],
                 "train/rkl_metric": metrics["rkl_metric"],
+                "train/d_fkl_mean": metrics.get("fkl_metric", 0.0),
                 "train/tokens": metrics["tokens"],
                 "train/step": step,
             }, step=step)
+
+        # Exact KL eval on a small subset
+        if cfg.eval_every > 0 and step % cfg.eval_every == 0:
+            with torch.no_grad():
+                k = min(4, len(prompts))
+                eval_prompts = prompts[-k:]
+                seqs_cpu, plens, pad_id = generate_continuations(
+                    student, tok, eval_prompts,
+                    cfg.max_new_tokens, cfg.temperature, cfg.top_p,
+                    cfg.gen_micro_batch,
+                    cfg.progress and accelerator.is_main_process,
+                )
+                r_sum = torch.tensor(0.0, device=accelerator.device)
+                f_sum = torch.tensor(0.0, device=accelerator.device)
+                t_sum = torch.tensor(0.0, device=accelerator.device)
+                it_eval = range(0, seqs_cpu.size(0), max(1, cfg.lp_micro_batch))
+                for i_eval in it_eval:
+                    sl = slice(i_eval, i_eval + max(1, cfg.lp_micro_batch))
+                    ids_mb = seqs_cpu[sl].to(accelerator.device, non_blocking=True)
+                    am_mb = ids_mb.ne(pad_id).long()
+                    with accelerator.autocast():
+                        logits_s = student(input_ids=ids_mb, attention_mask=am_mb, use_cache=False).logits
+                        logits_t = teacher(input_ids=ids_mb, attention_mask=am_mb, use_cache=True).logits
+                        logp_s = nn.functional.log_softmax(logits_s, dim=-1)
+                        logp_t = nn.functional.log_softmax(logits_t, dim=-1)
+                    # per-position exact KL
+                    r_pos = per_position_exact_kl(logp_s, logp_t, kind="rkl")
+                    f_pos = per_position_exact_kl(logp_s, logp_t, kind="fkl")
+                    # valid mask: continuation and non-pad
+                    cont_mb = torch.zeros_like(r_pos, dtype=torch.bool)
+                    for j, L in enumerate(plens[sl]):
+                        start_j = max(L - 1, 0)
+                        cont_mb[j, start_j:] = True
+                    valid_mb = cont_mb & am_mb[:, 1:].bool()
+                    r_sum = r_sum + r_pos.masked_select(valid_mb).sum()
+                    f_sum = f_sum + f_pos.masked_select(valid_mb).sum()
+                    t_sum = t_sum + valid_mb.sum()
+                # aggregate across ranks
+                r_all = accelerator.gather_for_metrics(r_sum).sum()
+                f_all = accelerator.gather_for_metrics(f_sum).sum()
+                t_all = accelerator.gather_for_metrics(t_sum).sum()
+                rkl_exact = (r_all / t_all).item() if t_all.item() > 0 else 0.0
+                fkl_exact = (f_all / t_all).item() if t_all.item() > 0 else 0.0
+                if accelerator.is_main_process:
+                    accelerator.print(f"eval rkl_exact={rkl_exact:.4f} fkl_exact={fkl_exact:.4f}")
+                if cfg.wandb_project:
+                    accelerator.log({
+                        "eval/rkl_exact": rkl_exact,
+                        "eval/fkl_exact": fkl_exact,
+                        "train/step": step,
+                    }, step=step)
 
         if accelerator.is_main_process and cfg.save_every > 0 and step % cfg.save_every == 0:
             ckpt_dir = os.path.join(cfg.output_dir, f"step-{step}")
@@ -434,7 +487,7 @@ def main(cfg: Config) -> None:
 
 
 def parse_args() -> Config:
-    p = argparse.ArgumentParser(description="Dual-KL 微批反向（正向+反向 KL）")
+    p = argparse.ArgumentParser(description="Dual-KL 微批反向（正向+反向 KL）- 固定权重版")
     p.add_argument("--student_model", type=str, required=True)
     p.add_argument("--teacher_model", type=str, required=True)
     p.add_argument("--output_dir", type=str, default="./dual-kl-out")
@@ -446,11 +499,7 @@ def parse_args() -> Config:
     p.add_argument("--top_p", type=float, default=0.95)
     p.add_argument("--learning_rate", type=float, default=5e-5)
     p.add_argument("--weight_decay", type=float, default=0.0)
-    p.add_argument("--tau", type=float, default=1.0)
-    p.add_argument("--alpha", type=float, default=5.0)
-    p.add_argument("--gating", type=str, default="soft", choices=["soft", "hard"])
-    p.add_argument("--rkl", type=str, default="exact", choices=["exact", "mc"])
-    p.add_argument("--fkl", type=str, default="full", choices=["full", "argmax"])
+    # rKL/fKL 均为 MC 实现，无需额外开关
     p.add_argument("--save_every", type=int, default=100)
     p.add_argument("--prompts_file", type=str, default=None)
     p.add_argument("--dataset", type=str, default=None)
@@ -471,6 +520,9 @@ def parse_args() -> Config:
     p.add_argument("--gen_micro_batch", type=int, default=8)
     p.add_argument("--lp_micro_batch", type=int, default=8)
     p.add_argument("--no_progress", action="store_true")
+    p.add_argument("--lam_r", type=float, default=1.0, help="rKL 权重（固定为1更合理），范围 0..1")
+    p.add_argument("--lam_f", type=float, default=1.0, help="fKL 基础权重（叠加位置衰减），范围 0..1")
+    p.add_argument("--fkl_pos_decay", action="store_true", help="启用 fKL 的位置衰减权重：pos_ratio = 1 - pos_in_seq/seq_len")
     a = p.parse_args()
     return Config(
         student_model=a.student_model,
@@ -484,11 +536,6 @@ def parse_args() -> Config:
         top_p=a.top_p,
         learning_rate=a.learning_rate,
         weight_decay=a.weight_decay,
-        tau=a.tau,
-        alpha=a.alpha,
-        gating=a.gating,
-        rkl=a.rkl,
-        fkl=a.fkl,
         save_every=a.save_every,
         prompts_file=a.prompts_file,
         dataset=a.dataset,
@@ -509,10 +556,12 @@ def parse_args() -> Config:
         gen_micro_batch=a.gen_micro_batch,
         lp_micro_batch=a.lp_micro_batch,
         progress=not a.no_progress,
+        lam_r=max(0.0, min(1.0, a.lam_r)),
+        lam_f=max(0.0, min(1.0, a.lam_f)),
+        fkl_pos_decay=bool(a.fkl_pos_decay),
     )
 
 
 if __name__ == "__main__":
     cfg = parse_args()
     main(cfg)
-
