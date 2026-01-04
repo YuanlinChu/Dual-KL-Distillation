@@ -43,6 +43,7 @@ class Config:
     save_every: int = 100
     prompts_file: str | None = None
     dataset: str | None = None
+    dataset_field: str = "question"
     max_prompt_tokens: int | None = None
     seed: int = 42
     use_lora: bool = False
@@ -105,6 +106,26 @@ def load_deepmath_prompts() -> List[str] | None:
 def get_prompts(cfg: Config) -> List[str]:
     if cfg.prompts_file:
         return load_prompts(cfg.prompts_file)
+    # 支持从本地 HF 数据集目录加载（datasets.save_to_disk 输出）
+    if cfg.dataset and os.path.exists(cfg.dataset):
+        try:
+            from datasets import load_from_disk  # type: ignore
+
+            obj = load_from_disk(cfg.dataset)
+            # 可能是 DatasetDict 或 Dataset
+            if hasattr(obj, "keys"):
+                split_name = "train" if "train" in obj.keys() else list(obj.keys())[0]
+                ds = obj[split_name]
+            else:
+                ds = obj
+            col = cfg.dataset_field or "question"
+            if col in ds.column_names:
+                return [str(v) for v in ds[col]]  # type: ignore
+            for alt in ["question", "prompt", "input", "text"]:
+                if alt in ds.column_names:
+                    return [str(v) for v in ds[alt]]  # type: ignore
+        except Exception:
+            pass
     if cfg.dataset == "deepmath":
         p = load_deepmath_prompts()
         if p:
@@ -178,9 +199,7 @@ def generate_continuations(
     pad_id = tok.pad_token_id if getattr(tok, "pad_token_id", None) is not None else 0
     with torch.no_grad():
         iterator = range(0, len(prompts), max(1, micro_batch))
-        bar = None
-        if show_progress and _HAVE_TQDM:
-            bar = tqdm(total=len(prompts), desc="gen", leave=False, dynamic_ncols=True)
+        # 移除生成阶段的微批次进度条（统一使用全局训练进度条）
         for i in iterator:
             chunk = prompts[i : i + max(1, micro_batch)]
             batch = tok(chunk, return_tensors="pt", padding=True, truncation=True)
@@ -197,10 +216,6 @@ def generate_continuations(
             max_T = max(max_T, gen.size(1))
             all_out_raw.append(gen.detach())
             all_plen.extend(batch["input_ids"].ne(pad_id).sum(dim=1).tolist())
-            if bar is not None:
-                bar.update(len(chunk))
-        if bar is not None:
-            bar.close()
 
     def pad_to(t: torch.Tensor, target_len: int, pad_token_id: int) -> torch.Tensor:
         if t.size(1) == target_len:
@@ -388,6 +403,10 @@ def main(cfg: Config) -> None:
 
     prompts = get_prompts(cfg)
     step = 0
+    # 全局训练进度条（显示 step/total）
+    global_bar = None
+    if cfg.progress and _HAVE_TQDM and accelerator.is_main_process:
+        global_bar = tqdm(total=cfg.steps, desc="train", dynamic_ncols=True)
     while step < cfg.steps:
         start = (step * cfg.batch_size) % max(1, len(prompts))
         end = start + cfg.batch_size
@@ -406,11 +425,20 @@ def main(cfg: Config) -> None:
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
         step += 1
+        if global_bar is not None:
+            global_bar.update(1)
 
         if accelerator.is_main_process and (step % 10 == 0 or step == 1):
-            accelerator.print(
-                f"step {step:05d} | loss={metrics['loss']:.4f} rkl={metrics['rkl_metric']:.4f} d_fkl={metrics.get('fkl_metric', 0.0):.4f} tokens={metrics['tokens']}"
+            msg = (
+                f"step {step:05d}/{cfg.steps:05d} | "
+                f"loss={metrics['loss']:.4f} rkl={metrics['rkl_metric']:.4f} d_fkl={metrics.get('fkl_metric', 0.0):.4f} tokens={metrics['tokens']}"
             )
+            if global_bar is not None:
+                global_bar.set_postfix_str(
+                    f"loss={metrics['loss']:.4f} rkl={metrics['rkl_metric']:.4f} fkl={metrics.get('fkl_metric', 0.0):.4f} tok={metrics['tokens']}"
+                )
+            else:
+                accelerator.print(msg)
         if cfg.wandb_project:
             accelerator.log({
                 "train/loss": metrics["loss"],
@@ -480,6 +508,8 @@ def main(cfg: Config) -> None:
             accelerator.print(f"已保存检查点到 {ckpt_dir}")
 
     if accelerator.is_main_process:
+        if global_bar is not None:
+            global_bar.close()
         to_save = accelerator.unwrap_model(student)
         to_save.save_pretrained(cfg.output_dir)
         tok.save_pretrained(cfg.output_dir)
@@ -503,6 +533,12 @@ def parse_args() -> Config:
     p.add_argument("--save_every", type=int, default=100)
     p.add_argument("--prompts_file", type=str, default=None)
     p.add_argument("--dataset", type=str, default=None)
+    p.add_argument(
+        "--dataset_field",
+        type=str,
+        default="question",
+        help="当 --dataset 指向本地 HF 数据集目录时，作为用户提示的字段名（默认 question）",
+    )
     p.add_argument("--max_prompt_tokens", type=int, default=None)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--use_lora", action="store_true")
@@ -539,6 +575,7 @@ def parse_args() -> Config:
         save_every=a.save_every,
         prompts_file=a.prompts_file,
         dataset=a.dataset,
+        dataset_field=a.dataset_field,
         max_prompt_tokens=a.max_prompt_tokens,
         seed=a.seed,
         use_lora=a.use_lora,

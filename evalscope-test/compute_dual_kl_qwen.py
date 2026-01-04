@@ -8,6 +8,9 @@ torchrun --nproc_per_node=8 compute_dual_kl_qwen.py --teacher_model Qwen/Qwen3-3
 
 torchrun --nproc_per_node=8 compute_dual_kl_qwen.py --teacher_model Qwen/Qwen3-32B --student_model Qwen/Qwen3-1.7B --dataset aime24 --aime_split train --max_samples 8 --max_new_tokens 2048 --dtype bf16 --ddp --output_json output-computekl-dklr1f0.5/dual_kl_metrics.json --plot_dir output-computekl-dklr1f0.5/entropy_plots --do_sample --temperature 0.7 --top_p 0.95 \
     --student_lora /hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath-lamr1f0.5/step-500
+
+torchrun --nproc_per_node=8 compute_dual_kl_qwen2.py --teacher_model Qwen/Qwen3-32B --student_model Qwen/Qwen3-1.7B --dataset aime24 --aime_split train --max_samples 30 --max_new_tokens 2048 --dtype bf16 --ddp --output_json output-computekl-dkls1000r1f0.2/dual_kl_metrics.json --plot_dir output-computekl-dkls1000r1f0.2/entropy_plots --do_sample --temperature 0.7 --top_p 0.95 \
+    --student_lora /hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath-lamr1f0.2/step-1000
 """
 
 from __future__ import annotations
@@ -58,6 +61,7 @@ class Args:
     top_p: float
     do_sample: bool
     eos_token: Optional[str]
+    ignore_eos: bool
     dtype: str
     device_map: str
     ddp: bool
@@ -281,9 +285,14 @@ def step_next(
     # last_token_id: shape [1]
     dev = device_of(model)
     inp = last_token_id.view(1, 1).to(dev)
-    out = model(input_ids=inp, use_cache=True, past_key_values=pkv.get("past_key_values"), attention_mask=pkv.get("attention_mask"))
+    # Expand attention_mask to include the newly generated token
+    attn_mask = pkv.get("attention_mask")
+    if attn_mask is not None:
+        ones = torch.ones((attn_mask.size(0), 1), dtype=attn_mask.dtype, device=attn_mask.device)
+        attn_mask = torch.cat([attn_mask, ones], dim=1)
+    out = model(input_ids=inp, use_cache=True, past_key_values=pkv.get("past_key_values"), attention_mask=attn_mask)
     logits = out.logits[:, -1, :]
-    pkv_new = {"past_key_values": out.past_key_values, "attention_mask": pkv.get("attention_mask")}
+    pkv_new = {"past_key_values": out.past_key_values, "attention_mask": attn_mask}
     return logits, pkv_new, inp.squeeze(0)
 
 
@@ -341,7 +350,8 @@ def follow_path_measure(
     do_sample: bool,
     temperature: float,
     top_p: float,
-    eos_token_id: Optional[int],
+    eos_token_ids: Optional[Sequence[int]],
+    ignore_eos: bool,
     forward_along_path: bool,
 ) -> Tuple[List[float], List[float], List[float]]:
     # Returns: (per-step KL along this path, entropies of PATH model, entropies of OTHER model) per step
@@ -370,7 +380,7 @@ def follow_path_measure(
             # Choose next token from PATH model
             next_id = sample_token(logits_path.squeeze(0), tok, do_sample=do_sample, temperature=temperature, top_p=top_p)
             last_token = torch.tensor(next_id, dtype=ids_path.dtype, device=device_of(path_model))
-            if eos_token_id is not None and int(next_id) == int(eos_token_id):
+            if (not ignore_eos) and eos_token_ids is not None and int(next_id) in set(int(x) for x in eos_token_ids):
                 break
 
     return kls, entropies_path, entropies_other
@@ -414,6 +424,7 @@ def main() -> None:
     ap.add_argument("--top_p", type=float, default=0.95)
     ap.add_argument("--do_sample", action="store_true", help="Use sampling for path following (default: greedy)")
     ap.add_argument("--eos_token", type=str, default=None, help="Optional EOS string to stop generation early")
+    ap.add_argument("--ignore_eos", action="store_true", help="Do not stop at EOS; always generate up to max_new_tokens")
     ap.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"]) 
     ap.add_argument("--device_map", type=str, default="auto", help="Transformers device_map (auto|cpu|cuda|balanced|none|ddp)")
     ap.add_argument("--ddp", action="store_true", help="Enable multi-GPU data-parallel with torch.distributed (use torchrun)")
@@ -436,6 +447,7 @@ def main() -> None:
         top_p=a.top_p,
         do_sample=bool(a.do_sample),
         eos_token=a.eos_token,
+        ignore_eos=bool(a.ignore_eos),
         dtype=a.dtype,
         device_map=a.device_map,
         ddp=bool(a.ddp or a.device_map == "ddp"),
@@ -452,14 +464,34 @@ def main() -> None:
         pass
 
     teacher, student, tok = load_models_and_tokenizer(args, device=device, ddp_on=ddp_on)
-    eos_token_id = None
+    # Resolve EOS token ids (support single or multiple)
+    eos_token_ids: Optional[Sequence[int]] = None
+    try:
+        gen_eos = getattr(student.generation_config, "eos_token_id", None)
+    except Exception:
+        gen_eos = None
     if args.eos_token is not None:
         try:
-            eos_token_id = tok.convert_tokens_to_ids(args.eos_token)
+            conv = tok.convert_tokens_to_ids(args.eos_token)
+            if isinstance(conv, (list, tuple)):
+                eos_token_ids = list(int(x) for x in conv)
+            else:
+                eos_token_ids = [int(conv)]
         except Exception:
-            eos_token_id = tok.eos_token_id
-    else:
-        eos_token_id = tok.eos_token_id
+            pass
+    if eos_token_ids is None:
+        if gen_eos is not None:
+            if isinstance(gen_eos, (list, tuple)):
+                eos_token_ids = list(int(x) for x in gen_eos)
+            else:
+                eos_token_ids = [int(gen_eos)]
+        else:
+            eos = getattr(tok, "eos_token_id", None)
+            if eos is not None:
+                if isinstance(eos, (list, tuple)):
+                    eos_token_ids = list(int(x) for x in eos)
+                else:
+                    eos_token_ids = [int(eos)]
 
     questions = load_questions(args)
     if args.max_samples is not None:
@@ -517,7 +549,8 @@ def main() -> None:
             do_sample=args.do_sample,
             temperature=args.temperature,
             top_p=args.top_p,
-            eos_token_id=eos_token_id,
+            eos_token_ids=eos_token_ids,
+            ignore_eos=bool(args.ignore_eos),
             forward_along_path=True,
         )
         fkl_values.extend(kls_t)
@@ -536,7 +569,8 @@ def main() -> None:
             do_sample=args.do_sample,
             temperature=args.temperature,
             top_p=args.top_p,
-            eos_token_id=eos_token_id,
+            eos_token_ids=eos_token_ids,
+            ignore_eos=bool(args.ignore_eos),
             forward_along_path=False,
         )
         rkl_values.extend(kls_s)

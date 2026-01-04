@@ -60,6 +60,7 @@ class Config:
     grad_accum: int = 1  # like num_substeps
     eval_every: int = 50
     dataset: str | None = None  # deepmath|tulu3|None
+    dataset_field: str = "question"  # 当 dataset 为本地 HF 数据集目录时，抽取文本字段
     max_prompt_tokens: int | None = None
     wandb_project: str | None = None
     wandb_name: str | None = None
@@ -117,6 +118,27 @@ def load_tulu3_prompts() -> List[str] | None:
 def get_prompts(cfg: Config) -> List[str]:
     if cfg.prompts_file:
         return load_prompts(cfg.prompts_file)
+    # 若 --dataset 传入的是一个本地目录，则尝试从磁盘加载 HF 数据集
+    if cfg.dataset and os.path.exists(cfg.dataset):
+        try:
+            from datasets import load_from_disk  # type: ignore
+
+            obj = load_from_disk(cfg.dataset)
+            # DatasetDict 或 Dataset
+            if hasattr(obj, "keys"):
+                split_name = "train" if "train" in obj.keys() else list(obj.keys())[0]
+                ds = obj[split_name]
+            else:
+                ds = obj
+            field = cfg.dataset_field or "question"
+            # 优先取指定字段，其次尝试常见字段
+            if field in ds.column_names:
+                return [str(v) for v in ds[field]]  # type: ignore
+            for alt in ["question", "prompt", "input", "text"]:
+                if alt in ds.column_names:
+                    return [str(v) for v in ds[alt]]  # type: ignore
+        except Exception:
+            pass
     if cfg.dataset == "deepmath":
         p = load_deepmath_prompts()
         if p:
@@ -188,9 +210,7 @@ def generate_continuations(
     pad_id: int = tokenizer.pad_token_id if getattr(tokenizer, "pad_token_id", None) is not None else 0
     with torch.no_grad():
         iterator = range(0, len(prompts), max(1, micro_batch))
-        bar = None
-        if show_progress and _HAVE_TQDM:
-            bar = tqdm(total=len(prompts), desc="gen", leave=False, dynamic_ncols=True)
+        # 移除微批次级别进度条（统一由全局训练进度条展示）
         for i in iterator:
             chunk = prompts[i : i + max(1, micro_batch)]
             batch = tokenizer(
@@ -214,10 +234,7 @@ def generate_continuations(
             if gen.size(1) > max_seq_len:
                 max_seq_len = gen.size(1)
             plens.extend(batch["input_ids"].ne(pad_id).sum(dim=1).tolist())
-            if bar is not None:
-                bar.update(len(chunk))
-        if bar is not None:
-            bar.close()
+        # 无微批进度条更新/关闭
     # Pad all micro-batch outputs to the same length before concatenation (CPU tensors)
     if len(outs) == 0:
         return torch.empty(0, dtype=torch.long), plens, pad_id
@@ -309,9 +326,6 @@ def train_step(
     teacher.eval()
     student.train()
     mb = max(1, cfg.lp_micro_batch)
-    bar_lp = None
-    if cfg.progress and _HAVE_TQDM and accelerator.is_main_process:
-        bar_lp = tqdm(total=B, desc="lp/back", leave=False, dynamic_ncols=True)
 
     # 指标累计
     d_rkl_sum = torch.tensor(0.0, device=accelerator.device)
@@ -355,14 +369,12 @@ def train_step(
         tokens_accum = tokens_accum + valid_mask_mb.sum().detach()
         loss_sum = loss_sum + loss_mb.detach()
 
-        if bar_lp is not None:
-            bar_lp.update(ids_mb.size(0))
+        # 移除微批次进度条更新
 
         # 释放切片张量
         del ids_mb, attn_mb, valid_mask_mb, logp_t_mb, logp_s_mb, s_g_mb, t_g_mb, rkl_loss_pos, loss_mb, d_rkl_mb, adv_mb
 
-    if bar_lp is not None:
-        bar_lp.close()
+    # 无微批次进度条关闭
 
     # 跨进程聚合指标
     rev_kl_mean = (
@@ -460,6 +472,10 @@ def main(cfg: Config) -> None:
 
     prompts = get_prompts(cfg)
     step = 0
+    # 全局训练进度条（当前 step/总 step）
+    global_bar = None
+    if cfg.progress and _HAVE_TQDM and accelerator.is_main_process:
+        global_bar = tqdm(total=cfg.steps, desc="train", dynamic_ncols=True)
     while step < cfg.steps:
         # Simple round-robin batching over prompts
         start = (step * cfg.batch_size) % max(1, len(prompts))
@@ -484,12 +500,20 @@ def main(cfg: Config) -> None:
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
         step += 1
+        if global_bar is not None:
+            global_bar.update(1)
 
         if accelerator.is_main_process and (step % 10 == 0 or step == 1):
-            accelerator.print(
-                f"step {step:05d} | loss={metrics['loss']:.4f} "
-                f"rev_kl={metrics['reverse_kl']:.4f} tokens={metrics['tokens']}"
+            msg = (
+                f"step {step:05d}/{cfg.steps:05d} | "
+                f"loss={metrics['loss']:.4f} rev_kl={metrics['reverse_kl']:.4f} tokens={metrics['tokens']}"
             )
+            if global_bar is not None:
+                global_bar.set_postfix_str(
+                    f"loss={metrics['loss']:.4f} rkl={metrics['reverse_kl']:.4f} tok={metrics['tokens']}"
+                )
+            else:
+                accelerator.print(msg)
         if cfg.wandb_project:
             accelerator.log({"train/loss": metrics["loss"], "train/reverse_kl": metrics["reverse_kl"], "train/tokens": metrics["tokens"], "train/step": step}, step=step)
 
@@ -553,6 +577,8 @@ def main(cfg: Config) -> None:
 
     # Final save
     if accelerator.is_main_process:
+        if global_bar is not None:
+            global_bar.close()
         # Final save
         to_save = accelerator.unwrap_model(student)
         if cfg.use_lora and PEFT_AVAILABLE and isinstance(to_save, PeftModel):
@@ -589,6 +615,12 @@ def parse_args() -> Config:
     p.add_argument("--grad_accum", type=int, default=1)
     p.add_argument("--eval_every", type=int, default=50)
     p.add_argument("--dataset", type=str, default=None)
+    p.add_argument(
+        "--dataset_field",
+        type=str,
+        default="question",
+        help="当 --dataset 指向本地 HF 数据集目录时，使用该列名作为用户提示字段，默认 question",
+    )
     p.add_argument("--max_prompt_tokens", type=int, default=None)
     p.add_argument("--wandb_project", type=str, default=None)
     p.add_argument("--wandb_name", type=str, default=None)
@@ -624,6 +656,7 @@ def parse_args() -> Config:
         grad_accum=a.grad_accum,
         eval_every=a.eval_every,
         dataset=a.dataset,
+        dataset_field=a.dataset_field,
         max_prompt_tokens=a.max_prompt_tokens,
         wandb_project=a.wandb_project,
         wandb_name=a.wandb_name,

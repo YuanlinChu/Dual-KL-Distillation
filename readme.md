@@ -1,20 +1,3 @@
-# setup 一共三个conda环境
-
-1. 配置训练环境
-- 安装conda环境
-- 安装依赖
-  ```bash
-  conda env create -f environment.yml
-  conda activate dualkl
-  ```
-
-2. 采用vllm搭配evalscope评估模型
-
-- vllm:0.12.0
-- evalscope: https://evalscope.readthedocs.io/zh-cn/latest/get_started/parameters.html
-
-# command：
-
 # baseline: on-policy distillation   / tulu3
 accelerate launch --config_file accelerate_config_multi_gpu.yaml \
   -m on_policy_distill.train_on_policy_local \
@@ -234,7 +217,7 @@ torchrun --nproc_per_node=8 compute_dual_kl_qwen.py --teacher_model Qwen/Qwen3-3
   --do_sample --temperature 0.7 --top_p 0.95 \
   --student_lora /hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath-long/step-500
 
-  torchrun --nproc_per_node=8 compute_dual_kl_qwen.py --teacher_model Qwen/Qwen3-32B --student_model Qwen/Qwen3-1.7B \
+torchrun --nproc_per_node=8 compute_dual_kl_qwen.py --teacher_model Qwen/Qwen3-32B --student_model Qwen/Qwen3-1.7B \
   --dataset aime24 --aime_split train --max_samples 30 --max_new_tokens 2048 --dtype bf16 --ddp \
   --output_json output-computekl-dklr0f1/dual_kl_metrics.json --plot_dir output-computekl-dklr0f1/entropy_plots \
   --do_sample --temperature 0.7 --top_p 0.95 \
@@ -272,3 +255,120 @@ accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
   --fkl_pos_decay \
   --lam_r 1 --lam_f 1 \
   --no_progress
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 vllm serve Qwen/Qwen3-1.7B --enable-lora --lora-modules 1.7b-dkl200_8-8192-lamr1f1-posdecay=/hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath-lamr1f1-posdecay/step-200 --max-lora-rank 64 --tensor-parallel-size 8 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+
+evalscope eval --model 1.7b-dkl200_8-8192-lamr1f1-posdecay --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 5 --dataset-args "$(cat dataset_args.json)"
+
+torchrun --nproc_per_node=8 compute_dual_kl_qwen2.py --teacher_model Qwen/Qwen3-32B --student_model Qwen/Qwen3-1.7B \
+  --dataset aime24 --aime_split train --max_samples 30 --max_new_tokens 2048 --dtype bf16 --ddp \
+  --output_json output-computekl-dklr1f1-posdecay/dual_kl_metrics.json --plot_dir output-computekl-dklr1f1-posdecay/entropy_plots \
+  --do_sample --temperature 0.7 --top_p 0.95 \
+  --student_lora /hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath-lamr1f1-posdecay/step-200
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 vllm serve Qwen/Qwen3-1.7B --enable-lora --lora-modules 1.7b-opd400-8192=/hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/opd-1.7b-32b-deepmath-long/step-400 --max-lora-rank 64 --tensor-parallel-size 8 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+
+evalscope eval --model 1.7b-opd400-8192 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 5 --dataset-args "$(cat dataset_args.json)"
+
+# baseline opd 0.6B 32B
+
+accelerate launch --config_file accelerate_config_multi_4gpu.yaml \
+  -m on_policy_distill.train_on_policy_local \
+  --student_model Qwen/Qwen3-0.6B --teacher_model Qwen/Qwen3-32B \
+  --dataset deepmath --batch_size 4 --group_size 4 --grad_accum 2 \
+  --gen_micro_batch 2 --lp_micro_batch 2 --kl_coef 1.0 --kl_discount 0.0 \
+  --max_new_tokens 2048 --max_prompt_tokens 256 --use_lora --lora_r 64 --dtype bf16 \
+  --wandb_project dualkl-distill --wandb_name opd-0.6b-32b-deepmath \
+  --teacher_ds_zero3 --output_dir ./out/opd-0.6b-32b-deepmath \
+  --no_progress
+
+accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
+  -m dual_kl.train_dualkl_new_4 \
+  --student_model Qwen/Qwen3-0.6B --teacher_model Qwen/Qwen3-32B \
+  --dataset deepmath --batch_size 8 --group_size 4 --grad_accum 1 \
+  --max_new_tokens 2048 --max_prompt_tokens 256 --use_lora --lora_r 64 --dtype bf16 \
+  --wandb_project dualkl-distill --wandb_name dkl-0.6b-32b-deepmath-lamr1f1-posdecay \
+  --teacher_ds_zero3 --gen_micro_batch 2 --lp_micro_batch 2 \
+  --output_dir ./out/dkl-0.6b-32b-deepmath-lamr1f1-posdecay \
+  --fkl_pos_decay \
+  --lam_r 1 --lam_f 1 \
+  --no_progress
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3-0.6B --enable-lora --lora-modules 0.6b-dkl300_8-8192=/hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-0.6b-32b-deepmath-lamr1f1-posdecay/step-300 --max-lora-rank 64 --tensor-parallel-size 4 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+
+evalscope eval --model 0.6b-dkl300_8-8192 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 5 --dataset-args "$(cat dataset_args.json)"
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3-0.6B --enable-lora --lora-modules 0.6b-opd500_4-8192=/hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/opd-0.6b-32b-deepmath/step-500 --max-lora-rank 64 --tensor-parallel-size 4 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+
+evalscope eval --model 0.6b-opd500_4-8192 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 5 --dataset-args "$(cat dataset_args.json)"
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3-0.6B --tensor-parallel-size 4 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+
+evalscope eval --model Qwen/Qwen3-0.6B --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 5 --dataset-args "$(cat dataset_args.json)"
+
+torchrun --nproc_per_node=8 compute_dual_kl_qwen2.py --teacher_model Qwen/Qwen3-32B --student_model Qwen/Qwen3-1.7B \
+  --dataset aime24 --aime_split train --max_samples 30 --max_new_tokens 2048 --dtype bf16 --ddp \
+  --output_json output-computekl-dklr1f1-posdecay-t0.1/dual_kl_metrics.json --plot_dir output-computekl-dklr1f1-posdecay-t0.1/entropy_plots \
+  --do_sample --temperature 0.1 --top_p 0.95 \
+  --student_lora /hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath-lamr1f1-posdecay/step-200
+
+torchrun --nproc_per_node=8 compute_dual_kl_qwen2.py --teacher_model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B --student_model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+  --dataset aime24 --aime_split train --max_samples 30 --max_new_tokens 2048 --dtype bf16 --ddp \
+  --output_json computekl-ds7B-1.5B/dual_kl_metrics.json --plot_dir computekl-ds7B-1.5B/entropy_plots \
+  --do_sample --temperature 0.7 --top_p 0.95 \
+  --student_lora /hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath-long/step-500
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 vllm serve Qwen/Qwen3-1.7B --enable-lora --lora-modules 1.7b-dkl300_8-8192-lamr1f1-posdecay=/hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath-lamr1f1-posdecay/step-300 --max-lora-rank 64 --tensor-parallel-size 8 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+
+evalscope eval --model 1.7b-dkl300_8-8192-lamr1f1-posdecay --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 5 --dataset-args "$(cat dataset_args.json)"
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3-1.7B --enable-lora --lora-modules 1.7b-dkl100_8-8192-lamr1f1-posdecay=/hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath-lamr1f1-posdecay/step-100 --max-lora-rank 64 --tensor-parallel-size 4 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+
+evalscope eval --model 1.7b-dkl100_8-8192-lamr1f1-posdecay --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 5 --dataset-args "$(cat dataset_args.json)"
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 vllm serve Qwen/Qwen3-1.7B --enable-lora --lora-modules 1.7b-dkl500_8-8192-lamr1f1-posdecay=/hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath-lamr1f1-posdecay/step-400 --max-lora-rank 64 --tensor-parallel-size 8 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+
+evalscope eval --model 1.7b-dkl500_8-8192-lamr1f1-posdecay --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 5 --dataset-args "$(cat dataset_args.json)"
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3-1.7B --enable-lora --lora-modules 1.7b-opd700_4-8192=/hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/opd-1.7b-32b-deepmath-long/step-700 --max-lora-rank 64 --tensor-parallel-size 4 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+
+evalscope eval --model 1.7b-opd700_4-8192 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 5 --dataset-args "$(cat dataset_args.json)"
+
+
+
+
+
+# sample数据量32k，训练1000step
+
+python sample_deepmath.py --source zwhe99/DeepMath-103K --split train --num-samples 32000 --output-dir DeepMath-32k
+
+## baseline 方案 -- opd
+accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
+  -m on_policy_distill.train_on_policy_local \
+  --student_model Qwen/Qwen3-1.7B --teacher_model Qwen/Qwen3-32B \
+  --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 1 \
+  --gen_micro_batch 2 --lp_micro_batch 2 --kl_coef 1.0 --kl_discount 0.0 \
+  --max_new_tokens 2048 --max_prompt_tokens 256 --use_lora --lora_r 64 --dtype bf16 \
+  --wandb_project dualkl-distill --wandb_name opd-1.7b-32b-deepmath_sample32k \
+  --teacher_ds_zero3 --output_dir ./out/opd-1.7b-32b-deepmath_sample32k \
+
+## new-4 方案 -- posdecay 和noposdecay
+accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
+  -m dual_kl.train_dualkl_new_4 \
+  --student_model Qwen/Qwen3-1.7B --teacher_model Qwen/Qwen3-32B \
+  --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 1 \
+  --max_new_tokens 2048 --max_prompt_tokens 256 --use_lora --lora_r 64 --dtype bf16 \
+  --wandb_project dualkl-distill --wandb_name dkl-1.7b-32b-deepmath_sample32k-noposdecay \
+  --teacher_ds_zero3 --gen_micro_batch 2 --lp_micro_batch 2 \
+  --output_dir ./out/dkl-1.7b-32b-deepmath_sample32k-noposdecay \
+  --lam_r 1 --lam_f 1
+
+accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
+  -m dual_kl.train_dualkl_new_4 \
+  --student_model Qwen/Qwen3-1.7B --teacher_model Qwen/Qwen3-32B \
+  --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 1 \
+  --max_new_tokens 2048 --max_prompt_tokens 256 --use_lora --lora_r 64 --dtype bf16 \
+  --wandb_project dualkl-distill --wandb_name dkl-1.7b-32b-deepmath_sample32k-posdecay \
+  --teacher_ds_zero3 --gen_micro_batch 2 --lp_micro_batch 2 \
+  --output_dir ./out/dkl-1.7b-32b-deepmath_sample32k-posdecay \
+  --lam_r 1 --lam_f 1 --fkl_pos_decay
