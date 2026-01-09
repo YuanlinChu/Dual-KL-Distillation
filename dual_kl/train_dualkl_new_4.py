@@ -52,7 +52,7 @@ class Config:
     lora_dropout: float = 0.05
     dtype: str = "bf16"
     grad_accum: int = 1
-    eval_every: int = 50
+    eval_every: int = 100
     wandb_project: str | None = None
     wandb_name: str | None = None
     wandb_mode: str = "online"
@@ -69,6 +69,9 @@ class Config:
     lam_f: float = 1.0
     # Enable position-decayed fKL weight: pos_ratio = 1 - pos_in_seq / seq_len
     fkl_pos_decay: bool = False
+    # Chat formatting
+    use_chat_template: bool = False
+    system_prompt: str | None = "Please reason step by step, and put your final answer within \\boxed{{}}."
 
 
 def ensure_pad_token(tok: PreTrainedTokenizerBase) -> None:
@@ -155,6 +158,43 @@ def truncate_by_tokens(tok: PreTrainedTokenizerBase, text: str, max_tokens: int)
         return text
     ids = ids[:max_tokens]
     return tok.decode(ids)
+
+def apply_chat_format(
+    tok: PreTrainedTokenizerBase,
+    questions: List[str],
+    use_chat_template: bool,
+    system_prompt: str | None,
+) -> List[str]:
+    """Return prompts formatted as chat messages if requested.
+
+    Prefer tokenizer.apply_chat_template when available; otherwise fall back
+    to a simple textual prefix that mimics chat structure.
+    """
+    if not use_chat_template:
+        # No formatting requested; optionally prepend a light system prefix
+        if system_prompt:
+            return [f"{system_prompt}\n\nUser: {q}\nAssistant:" for q in questions]
+        return questions
+
+    out: List[str] = []
+    has_template = hasattr(tok, "apply_chat_template") and callable(getattr(tok, "apply_chat_template"))
+    for q in questions:
+        if has_template:
+            msgs = []
+            if system_prompt:
+                msgs.append({"role": "system", "content": system_prompt})
+            msgs.append({"role": "user", "content": q})
+            try:
+                txt = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+            except Exception:
+                # Fallback to simple textual template
+                pref = (system_prompt + "\n\n") if system_prompt else ""
+                txt = f"{pref}User: {q}\nAssistant:"
+        else:
+            pref = (system_prompt + "\n\n") if system_prompt else ""
+            txt = f"{pref}User: {q}\nAssistant:"
+        out.append(txt)
+    return out
 
 def per_position_exact_kl(logp_s: torch.Tensor, logp_t: torch.Tensor, kind: str) -> torch.Tensor:
     """Return per-position exact KL (no aggregation) with shape [B, T-1].
@@ -363,12 +403,11 @@ def main(cfg: Config) -> None:
     student = AutoModelForCausalLM.from_pretrained(cfg.student_model, dtype=torch_dtype if torch_dtype else None)
     teacher = AutoModelForCausalLM.from_pretrained(cfg.teacher_model, dtype=torch_dtype if torch_dtype else None)
     tok = AutoTokenizer.from_pretrained(cfg.student_model)
+    ensure_pad_token(tok)
     try:
-        if getattr(tok, "pad_token_id", None) is not None:
-            tok.padding_side = "left"
+        tok.padding_side = "left"
     except Exception:
         pass
-    ensure_pad_token(tok)
 
     if cfg.use_lora:
         if not PEFT_AVAILABLE:
@@ -415,6 +454,8 @@ def main(cfg: Config) -> None:
         rank = accelerator.process_index
         groups_shard = [g for i, g in enumerate(groups) if i % max(1, world) == rank]
         batch_prompts = [p for p in groups_shard for _ in range(cfg.group_size)]
+        # Apply chat/system formatting if requested
+        batch_prompts = apply_chat_format(tok, batch_prompts, cfg.use_chat_template, cfg.system_prompt)
         if cfg.max_prompt_tokens is not None:
             batch_prompts = [truncate_by_tokens(tok, p, cfg.max_prompt_tokens) for p in batch_prompts]
 
@@ -453,6 +494,7 @@ def main(cfg: Config) -> None:
             with torch.no_grad():
                 k = min(4, len(prompts))
                 eval_prompts = prompts[-k:]
+                eval_prompts = apply_chat_format(tok, eval_prompts, cfg.use_chat_template, cfg.system_prompt)
                 seqs_cpu, plens, pad_id = generate_continuations(
                     student, tok, eval_prompts,
                     cfg.max_new_tokens, cfg.temperature, cfg.top_p,
@@ -547,7 +589,7 @@ def parse_args() -> Config:
     p.add_argument("--lora_dropout", type=float, default=0.05)
     p.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"])
     p.add_argument("--grad_accum", type=int, default=1)
-    p.add_argument("--eval_every", type=int, default=50)
+    p.add_argument("--eval_every", type=int, default=100)
     p.add_argument("--wandb_project", type=str, default=None)
     p.add_argument("--wandb_name", type=str, default=None)
     p.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline", "disabled"])
@@ -559,6 +601,14 @@ def parse_args() -> Config:
     p.add_argument("--lam_r", type=float, default=1.0, help="rKL 权重（固定为1更合理），范围 0..1")
     p.add_argument("--lam_f", type=float, default=1.0, help="fKL 基础权重（叠加位置衰减），范围 0..1")
     p.add_argument("--fkl_pos_decay", action="store_true", help="启用 fKL 的位置衰减权重：pos_ratio = 1 - pos_in_seq/seq_len")
+    # Chat formatting
+    p.add_argument("--use_chat_template", action="store_true", help="使用 tokenizer.apply_chat_template 构造 system/user 对话提示")
+    p.add_argument(
+        "--system_prompt",
+        type=str,
+        default="Please reason step by step, and put your final answer within \\boxed{{}}.",
+        help="可选的系统提示（作为 system role 或文本前缀）",
+    )
     a = p.parse_args()
     return Config(
         student_model=a.student_model,
@@ -596,6 +646,8 @@ def parse_args() -> Config:
         lam_r=max(0.0, min(1.0, a.lam_r)),
         lam_f=max(0.0, min(1.0, a.lam_f)),
         fkl_pos_decay=bool(a.fkl_pos_decay),
+        use_chat_template=bool(a.use_chat_template),
+        system_prompt=a.system_prompt,
     )
 
 

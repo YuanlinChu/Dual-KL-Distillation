@@ -334,6 +334,26 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3-1.7B --enable-lora --lora-mod
 
 evalscope eval --model 1.7b-opd700_4-8192 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 5 --dataset-args "$(cat dataset_args.json)"
 
+## 1.7b-dkl200_8-8192-lamr1f1-noposdecay
+CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3-1.7B --enable-lora --lora-modules 1.7b-dkl200_8-8192-lamr1f1-noposdecay=/hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath-lamr1f1-noposdecay/step-200 --max-lora-rank 64 --tensor-parallel-size 4 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+
+evalscope eval --model 1.7b-dkl300_8-8192-lamr1f1-noposdecay --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 3 --dataset-args "$(cat dataset_args.json)"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -352,6 +372,10 @@ accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
   --wandb_project dualkl-distill --wandb_name opd-1.7b-32b-deepmath_sample32k \
   --teacher_ds_zero3 --output_dir ./out/opd-1.7b-32b-deepmath_sample32k \
 
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 vllm serve out/opd-1.7b-32b-deepmath_sample32k-step1000-merged --served-model-name 1.7b-opd1000_8-sample32k-8192 --tensor-parallel-size 8 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+
+evalscope eval --model 1.7b-opd1000_8-sample32k-8192 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 5 --dataset-args "$(cat dataset_args.json)"
+
 ## new-4 方案 -- posdecay 和noposdecay
 accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
   -m dual_kl.train_dualkl_new_4 \
@@ -368,7 +392,96 @@ accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
   --student_model Qwen/Qwen3-1.7B --teacher_model Qwen/Qwen3-32B \
   --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 1 \
   --max_new_tokens 2048 --max_prompt_tokens 256 --use_lora --lora_r 64 --dtype bf16 \
+  --wandb_project dualkl-distill --wandb_name dkl-1.7b-32b-deepmath_sample32k-noposdecay \
+  --teacher_ds_zero3 --gen_micro_batch 2 --lp_micro_batch 2 --learning_rate 1e-6 \
+  --output_dir ./out/dkl-1.7b-32b-deepmath_sample32k-noposdecay \
+  --lam_r 1 --lam_f 1
+
+accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
+  -m dual_kl.train_dualkl_new_4 \
+  --student_model Qwen/Qwen3-1.7B --teacher_model Qwen/Qwen3-32B \
+  --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 1 \
+  --max_new_tokens 2048 --max_prompt_tokens 256 --use_lora --lora_r 64 --dtype bf16 \
   --wandb_project dualkl-distill --wandb_name dkl-1.7b-32b-deepmath_sample32k-posdecay \
   --teacher_ds_zero3 --gen_micro_batch 2 --lp_micro_batch 2 \
   --output_dir ./out/dkl-1.7b-32b-deepmath_sample32k-posdecay \
   --lam_r 1 --lam_f 1 --fkl_pos_decay
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 vllm serve out/dkl-1.7b-32b-deepmath_sample32k-posdecay-step800-merged --served-model-name 1.7b-dkl800_8_posdecay-sample32k-8192 --tensor-parallel-size 8 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+
+evalscope eval --model 1.7b-dkl800_8_posdecay-sample32k-8192 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 5 --dataset-args "$(cat dataset_args.json)"
+
+## base 模型  Qwen3-32B
+CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3-32B --tensor-parallel-size 4 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+
+evalscope eval --model Qwen/Qwen3-32B --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 3 --dataset-args "$(cat dataset_args.json)"
+
+## base 模型  Qwen3-1.7B
+CUDA_VISIBLE_DEVICES=0,1 vllm serve Qwen/Qwen3-1.7B --tensor-parallel-size 2 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+
+evalscope eval --model Qwen/Qwen3-1.7B --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 3 --dataset-args "$(cat dataset_args.json)"
+
+CUDA_VISIBLE_DEVICES=2,3 vllm serve Qwen/Qwen3-1.7B --tensor-parallel-size 2 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8802
+
+evalscope eval --model Qwen/Qwen3-1.7B --api-url http://127.0.0.1:8802/v1 --api-key EMPTY --eval-type openai_api --datasets math_500 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 3 --dataset-args "$(cat dataset_args.json)"
+
+## eval 多个step的lora结果
+
+CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3-1.7B --enable-lora --lora-modules 1.7b-opd800_8-sample32k-8192=out/opd-1.7b-32b-deepmath_sample32k/step-800 --max-lora-rank 64 --tensor-parallel-size 1 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+
+evalscope eval --model 1.7b-opd800_8-sample32k-8192 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 3 --dataset-args "$(cat dataset_args.json)"
+
+CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-1.7B --enable-lora --lora-modules 1.7b-opd600_8-sample32k-8192=out/opd-1.7b-32b-deepmath_sample32k/step-600 --max-lora-rank 64 --tensor-parallel-size 1 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8802
+
+evalscope eval --model 1.7b-opd600_8-sample32k-8192 --api-url http://127.0.0.1:8802/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 3 --dataset-args "$(cat dataset_args.json)"
+
+CUDA_VISIBLE_DEVICES=2 vllm serve Qwen/Qwen3-1.7B --enable-lora --lora-modules 1.7b-opd400_8-sample32k-8192=out/opd-1.7b-32b-deepmath_sample32k/step-400 --max-lora-rank 64 --tensor-parallel-size 1 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8803
+
+evalscope eval --model 1.7b-opd400_8-sample32k-8192 --api-url http://127.0.0.1:8803/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 3 --dataset-args "$(cat dataset_args.json)"
+
+CUDA_VISIBLE_DEVICES=3 vllm serve Qwen/Qwen3-1.7B --enable-lora --lora-modules 1.7b-opd200_8-sample32k-8192=out/opd-1.7b-32b-deepmath_sample32k/step-200 --max-lora-rank 64 --tensor-parallel-size 1 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8804
+
+evalscope eval --model 1.7b-opd200_8-sample32k-8192 --api-url http://127.0.0.1:8804/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 3 --dataset-args "$(cat dataset_args.json)"
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3-1.7B --enable-lora --lora-modules 1.7b-dkl1000_8_posdecay-sample32k-8192=/hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath_sample32k-posdecay/step-1000 --max-lora-rank 64 --tensor-parallel-size 4 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+
+evalscope eval --model 1.7b-dkl1000_8_posdecay-sample32k-8192 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 3 --dataset-args "$(cat dataset_args.json)"
+
+# 测输出长度 max 2048 4096
+Qwen3-32B  avg_len  1857.44  3297
+dkl-1.7b-32b-deepmath_sample32k-step400-merged  avg_len 2029  3390
+opd-1.7b-32b-deepmath_sample32k-step400-merged  avg_len 2091  4139
+
+
+
+
+accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
+  -m dual_kl.train_dualkl_new_4 \
+  --student_model Qwen/Qwen3-1.7B-Base --teacher_model Qwen/Qwen3-32B \
+  --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 1 \
+  --max_new_tokens 2048 --max_prompt_tokens 512 --use_lora --lora_r 64 --dtype bf16 \
+  --wandb_project dualkl-distill --wandb_name dkl-1.7b-32b-deepmath_32k-no_posdecay \
+  --teacher_ds_zero3 --gen_micro_batch 2 --lp_micro_batch 2 \
+  --output_dir ./out/dkl-1.7b-32b-deepmath_32k-no_posdecay \
+  --lam_r 1 --lam_f 1 --use_chat_template
+
+accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
+  -m dual_kl.train_dualkl_new_4 \
+  --student_model Qwen/Qwen3-1.7B-Base --teacher_model Qwen/Qwen3-32B \
+  --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 1 \
+  --max_new_tokens 2048 --max_prompt_tokens 256 --use_lora --lora_r 64 --dtype bf16 \
+  --wandb_project dualkl-distill --wandb_name dkl-1.7b-32b-deepmath_sample32k-posdecay \
+  --teacher_ds_zero3 --gen_micro_batch 2 --lp_micro_batch 2 \
+  --output_dir ./out/dkl-1.7b-32b-deepmath_sample32k-posdecay \
+  --lam_r 1 --lam_f 1 --fkl_pos_decay \
+  --use_chat_template
+
+accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
+  -m on_policy_distill.train_on_policy_local \
+  --student_model Qwen/Qwen3-1.7B-Base --teacher_model Qwen/Qwen3-32B \
+  --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 1 \
+  --gen_micro_batch 2 --lp_micro_batch 2 --kl_coef 1.0 --kl_discount 0.0 \
+  --max_new_tokens 2048 --max_prompt_tokens 256 --use_lora --lora_r 64 --dtype bf16 \
+  --wandb_project dualkl-distill --wandb_name opd-1.7b-32b-deepmath_32k \
+  --teacher_ds_zero3 --output_dir ./out/opd-1.7b-32b-deepmath_32k \
+  --use_chat_template

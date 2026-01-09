@@ -73,6 +73,9 @@ class Config:
     lp_micro_batch: int = 8
     # Progress bar control
     progress: bool = True
+    # Chat formatting
+    use_chat_template: bool = False
+    system_prompt: str | None = "Please reason step by step, and put your final answer within \\boxed{{}}."
 
 
 def load_prompts(path: str | None) -> List[str]:
@@ -156,6 +159,41 @@ def truncate_by_tokens(tokenizer: PreTrainedTokenizerBase, text: str, max_tokens
         return text
     ids = ids[:max_tokens]
     return tokenizer.decode(ids)
+
+def apply_chat_format(
+    tokenizer: PreTrainedTokenizerBase,
+    questions: List[str],
+    use_chat_template: bool,
+    system_prompt: str | None,
+) -> List[str]:
+    """Format plain questions into chat prompts if requested.
+
+    Prefer tokenizer.apply_chat_template when available; otherwise fall back to
+    a simple textual prefix mimicking chat structure.
+    """
+    if not use_chat_template:
+        if system_prompt:
+            return [f"{system_prompt}\n\nUser: {q}\nAssistant:" for q in questions]
+        return questions
+
+    out: List[str] = []
+    has_template = hasattr(tokenizer, "apply_chat_template") and callable(getattr(tokenizer, "apply_chat_template"))
+    for q in questions:
+        if has_template:
+            msgs = []
+            if system_prompt:
+                msgs.append({"role": "system", "content": system_prompt})
+            msgs.append({"role": "user", "content": q})
+            try:
+                txt = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+            except Exception:
+                pref = (system_prompt + "\n\n") if system_prompt else ""
+                txt = f"{pref}User: {q}\nAssistant:"
+        else:
+            pref = (system_prompt + "\n\n") if system_prompt else ""
+            txt = f"{pref}User: {q}\nAssistant:"
+        out.append(txt)
+    return out
 
 
 def per_position_exact_kl(logp_s: torch.Tensor, logp_t: torch.Tensor, kind: str) -> torch.Tensor:
@@ -407,12 +445,11 @@ def main(cfg: Config) -> None:
         cfg.teacher_model, dtype=torch_dtype if torch_dtype is not None else None
     )
     tokenizer = AutoTokenizer.from_pretrained(cfg.student_model)
+    ensure_pad_token(tokenizer)
     try:
-        if getattr(tokenizer, "pad_token_id", None) is not None:
-            tokenizer.padding_side = "left"
+        tokenizer.padding_side = "left"
     except Exception:
         pass
-    ensure_pad_token(tokenizer)
 
     # Optional LoRA (apply before prepare)
     if cfg.use_lora:
@@ -490,6 +527,8 @@ def main(cfg: Config) -> None:
         groups_shard = [g for i, g in enumerate(groups) if i % max(1, world) == rank]
         # Expand by group_size to mimic multiple rollouts per prompt
         batch_prompts = [p for p in groups_shard for _ in range(cfg.group_size)]
+        # Apply chat/system formatting if requested
+        batch_prompts = apply_chat_format(tokenizer, batch_prompts, cfg.use_chat_template, cfg.system_prompt)
         # Optional prompt truncation
         if cfg.max_prompt_tokens is not None:
             batch_prompts = [truncate_by_tokens(tokenizer, p, cfg.max_prompt_tokens) for p in batch_prompts]
@@ -522,6 +561,7 @@ def main(cfg: Config) -> None:
             with torch.no_grad():
                 k = min(4, len(prompts))
                 eval_prompts = prompts[-k:] if k > 0 else []
+                eval_prompts = apply_chat_format(tokenizer, eval_prompts, cfg.use_chat_template, cfg.system_prompt) if eval_prompts else []
                 if eval_prompts:
                     seqs_cpu, plens, pad_id = generate_continuations(
                         student, tokenizer, eval_prompts,
@@ -630,6 +670,14 @@ def parse_args() -> Config:
     p.add_argument("--no_progress", action="store_true", help="关闭进度条显示（默认开启，仅主进程显示）")
     p.add_argument("--gen_micro_batch", type=int, default=8, help="生成阶段微批大小")
     p.add_argument("--lp_micro_batch", type=int, default=8, help="logprob 前向微批大小")
+    # Chat formatting
+    p.add_argument("--use_chat_template", action="store_true", help="使用 tokenizer.apply_chat_template 构造 system/user 对话提示")
+    p.add_argument(
+        "--system_prompt",
+        type=str,
+        default="Please reason step by step, and put your final answer within \\boxed{{}}.",
+        help="可选的系统提示（作为 system role 或文本前缀）",
+    )
     a = p.parse_args()
     return Config(
         student_model=a.student_model,
@@ -666,6 +714,8 @@ def parse_args() -> Config:
         gen_micro_batch=a.gen_micro_batch,
         lp_micro_batch=a.lp_micro_batch,
         progress=not a.no_progress,
+        use_chat_template=bool(a.use_chat_template),
+        system_prompt=a.system_prompt,
     )
 
 

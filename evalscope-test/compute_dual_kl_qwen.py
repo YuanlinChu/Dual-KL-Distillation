@@ -1,15 +1,14 @@
 """
-torchrun --nproc_per_node=8 compute_dual_kl_qwen.py --teacher_model Qwen/Qwen3-32B --student_model Qwen/Qwen3-1.7B --dataset aime24 --aime_split train --max_samples 8 --max_new_tokens 2048 --dtype bf16 --ddp --output_json output-computekl-base/dual_kl_metrics.json --plot_dir output-computekl-base/entropy_plots --do_sample --temperature 0.7 --top_p 0.95
+torchrun --nproc_per_node=8 compute_dual_kl_qwen.py --teacher_model Qwen/Qwen3-32B --student_model Qwen/Qwen3-1.7B --dataset aime24 --aime_split train --max_samples 8 --max_new_tokens 2048 --dtype bf16 --ddp --output_json entropy-count-metrics/output-computekl-base/dual_kl_metrics.json --plot_dir entropy-count-metrics/utput-computekl-base/entropy_plots --do_sample --temperature 0.7 --top_p 0.95
 
 
-torchrun --nproc_per_node=8 compute_dual_kl_qwen.py --teacher_model Qwen/Qwen3-32B --student_model Qwen/Qwen3-1.7B --dataset aime24 --aime_split train --max_samples 8 --max_new_tokens 2048 --dtype bf16 --ddp --output_json output-computekl-opd/dual_kl_metrics.json --plot_dir output-computekl-opd/entropy_plots --do_sample --temperature 0.7 --top_p 0.95 \
+torchrun --nproc_per_node=8 compute_dual_kl_qwen.py --teacher_model Qwen/Qwen3-32B --student_model Qwen/Qwen3-1.7B --dataset aime24 --aime_split train --max_samples 8 --max_new_tokens 2048 --dtype bf16 --ddp --output_json entropy-count-metrics/output-computekl-opd/dual_kl_metrics.json --plot_dir entropy-count-metrics/output-computekl-opd/entropy_plots --do_sample --temperature 0.7 --top_p 0.95 \
     --student_lora /hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/opd-1.7b-32b-deepmath-long/step-500
 
-
-torchrun --nproc_per_node=8 compute_dual_kl_qwen.py --teacher_model Qwen/Qwen3-32B --student_model Qwen/Qwen3-1.7B --dataset aime24 --aime_split train --max_samples 8 --max_new_tokens 2048 --dtype bf16 --ddp --output_json output-computekl-dklr1f0.5/dual_kl_metrics.json --plot_dir output-computekl-dklr1f0.5/entropy_plots --do_sample --temperature 0.7 --top_p 0.95 \
+torchrun --nproc_per_node=8 compute_dual_kl_qwen.py --teacher_model Qwen/Qwen3-32B --student_model Qwen/Qwen3-1.7B --dataset aime24 --aime_split train --max_samples 8 --max_new_tokens 2048 --dtype bf16 --ddp --output_json entropy-count-metrics/output-computekl-dklr1f0.5/dual_kl_metrics.json --plot_dir entropy-count-metrics/output-computekl-dklr1f0.5/entropy_plots --do_sample --temperature 0.7 --top_p 0.95 \
     --student_lora /hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath-lamr1f0.5/step-500
 
-torchrun --nproc_per_node=8 compute_dual_kl_qwen2.py --teacher_model Qwen/Qwen3-32B --student_model Qwen/Qwen3-1.7B --dataset aime24 --aime_split train --max_samples 30 --max_new_tokens 2048 --dtype bf16 --ddp --output_json output-computekl-dkls1000r1f0.2/dual_kl_metrics.json --plot_dir output-computekl-dkls1000r1f0.2/entropy_plots --do_sample --temperature 0.7 --top_p 0.95 \
+torchrun --nproc_per_node=8 compute_dual_kl_qwen2.py --teacher_model Qwen/Qwen3-32B --student_model Qwen/Qwen3-1.7B --dataset aime24 --aime_split train --max_samples 30 --max_new_tokens 2048 --dtype bf16 --ddp --output_json entropy-count-metrics/output-computekl-dkls1000r1f0.2/dual_kl_metrics.json --plot_dir entropy-count-metrics/output-computekl-dkls1000r1f0.2/entropy_plots --do_sample --temperature 0.7 --top_p 0.95 \
     --student_lora /hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath-lamr1f0.2/step-1000
 """
 

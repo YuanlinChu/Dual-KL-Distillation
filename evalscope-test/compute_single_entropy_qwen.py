@@ -14,8 +14,58 @@ torchrun --nproc_per_node=8 compute_single_entropy_qwen.py \
   --dataset aime24 --aime_split train \
   --max_samples 8 --max_new_tokens 8196 --dtype bf16 --ddp \
   --lora /hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath-lamr1f1-posdecay/step-200 \
-  --output_json output-Qwen3-1.7B-r1f1posdecay/entropy_metrics.json \
-  --plot_dir output-Qwen3-1.7B-r1f1posdecay/entropy_plots \
+  --output_json output-Qwen3-1.7B-dklr1f1posdecay/entropy_metrics.json \
+  --plot_dir output-Qwen3-1.7B-dklr1f1posdecay/entropy_plots \
+  --do_sample --temperature 0.7 --top_p 0.95
+
+torchrun --nproc_per_node=8 compute_single_entropy_qwen.py \
+  --model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
+  --dataset aime24 --aime_split train \
+  --max_samples 8 --max_new_tokens 8196 --dtype bf16 --ddp \
+  --output_json output-DS-7B-base-t0/entropy_metrics.json \
+  --plot_dir output-DS-7B-base-t0/entropy_plots \
+  --do_sample --temperature 0.0 --top_p 0.95
+
+torchrun --nproc_per_node=8 compute_single_entropy_qwen.py \
+  --model Qwen/Qwen2.5-Math-1.5B \
+  --dataset aime24 --aime_split train \
+  --max_samples 8 --max_new_tokens 8196 --dtype bf16 --ddp \
+  --output_json output-Qwen2.5-Math-1.5B-base/entropy_metrics.json \
+  --plot_dir output-Qwen2.5-Math-1.5B-base/entropy_plots \
+  --do_sample --temperature 0.7 --top_p 0.95
+
+torchrun --nproc_per_node=8 compute_single_entropy_qwen.py \
+  --model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+  --dataset aime24 --aime_split train \
+  --max_samples 8 --max_new_tokens 8196 --dtype bf16 --ddp \
+  --output_json output-DS-1.5B-base-t0/entropy_metrics.json \
+  --plot_dir output-DS-1.5B-base-t0/entropy_plots \
+  --do_sample --temperature 0.0 --top_p 0.95
+
+CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 compute_single_entropy_qwen2.py \
+  --model Qwen/Qwen3-1.7B \
+  --dataset aime24 --aime_split train \
+  --max_samples 8 --max_new_tokens 8196 --dtype bf16 --ddp \
+  --output_json output-Qwen3-1.7B-base2/entropy_metrics.json \
+  --plot_dir output-Qwen3-1.7B-base2/entropy_plots \
+  --do_sample --temperature 0.7 --top_p 0.95
+
+CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 compute_single_entropy_qwen2.py \
+  --model Qwen/Qwen3-1.7B \
+  --dataset aime24 --aime_split train \
+  --max_samples 8 --max_new_tokens 8196 --dtype bf16 --ddp \
+  --lora /hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath-lamr1f1-posdecay/step-200\
+  --output_json output-Qwen3-1.7B-dklr1f1posdecay2/entropy_metrics.json \
+  --plot_dir output-Qwen3-1.7B-dklr1f1posdecay2/entropy_plots \
+  --do_sample --temperature 0.7 --top_p 0.95
+
+CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 compute_single_entropy_qwen2.py \
+  --model Qwen/Qwen3-1.7B \
+  --dataset aime24 --aime_split train \
+  --max_samples 8 --max_new_tokens 8196 --dtype bf16 --ddp \
+  --lora /hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/opd-1.7b-32b-deepmath-long/step-400\
+  --output_json output-Qwen3-1.7B-opd400/entropy_metrics.json \
+  --plot_dir output-Qwen3-1.7B-opd400/entropy_plots \
   --do_sample --temperature 0.7 --top_p 0.95
 """
 

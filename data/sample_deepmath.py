@@ -12,6 +12,12 @@ Example:
     --repo-id zwhe99/DeepMath-103K \
     --push-to-hub
 
+- 采样并推送（示例）:
+      - python sample_deepmath.py --source zwhe99/DeepMath-103K --split train --num-samples 32000 --seed 42 --repo-id zwhe99/DeepMath-
+        103K --push-to-hub
+- 可选本地保存:
+      - python sample_deepmath.py --source zwhe99/DeepMath-103K --split train --num-samples 32000 --output-dir DeepMath-32k
+
 Notes:
 - You must have `datasets` installed: pip install datasets
 - To push to hub, set `HF_TOKEN` env var or be logged in via `huggingface-cli login`.
