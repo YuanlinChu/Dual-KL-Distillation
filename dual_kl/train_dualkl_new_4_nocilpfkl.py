@@ -339,9 +339,7 @@ def train_step(
         s_g_t = logp_s[:, :-1, :].gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
         # Advantage for fKL: only penalize when teacher prob > student prob
         d_fkl_mb = (t_g_t - s_g_t).detach()
-        d_fkl_relu = torch.relu(d_fkl_mb)
-        fkl_loss_pos = - d_fkl_relu * s_g_t
-
+        fkl_loss_pos = - s_g_t
         # Position-decayed weight for fKL (optional)
         if cfg.fkl_pos_decay:
             # pos_in_seq counts from the first generated token (after prompt)
