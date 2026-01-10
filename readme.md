@@ -454,8 +454,21 @@ opd-1.7b-32b-deepmath_sample32k-step400-merged  avg_len 2091  4139
 
 
 
-## teacher用8b跑实验
-accelerate launch --config_file accelerate_config_multi_4gpu.yaml \
+# teacher用8b跑实验
+
+### opd
+accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
+  -m on_policy_distill.train_on_policy_local \
+  --student_model Qwen/Qwen3-1.7B-Base --teacher_model Qwen/Qwen3-8B \
+  --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 1 \
+  --gen_micro_batch 2 --lp_micro_batch 2 --kl_coef 1.0 --kl_discount 0.0 \
+  --max_new_tokens 2048 --max_prompt_tokens 512 --use_lora --lora_r 64 --dtype bf16 \
+  --wandb_project dualkl-distill --wandb_name opd-1.7b-8b-deepmath_32k \
+  --teacher_ds_zero3 --output_dir ./out/opd-1.7b-8b-deepmath_32k \
+  --use_chat_template
+
+### dkl: relu-fkl + no posdecay
+accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
   -m dual_kl.train_dualkl_new_4 \
   --student_model Qwen/Qwen3-1.7B-Base --teacher_model Qwen/Qwen3-8B \
   --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 1 \
@@ -465,23 +478,26 @@ accelerate launch --config_file accelerate_config_multi_4gpu.yaml \
   --output_dir ./out/dkl-1.7b-8b-deepmath_32k-no_posdecay \
   --lam_r 1 --lam_f 1 --use_chat_template
 
+### dkl: relu-fkl + posdecay
 accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
   -m dual_kl.train_dualkl_new_4 \
   --student_model Qwen/Qwen3-1.7B-Base --teacher_model Qwen/Qwen3-8B \
   --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 1 \
   --max_new_tokens 2048 --max_prompt_tokens 512 --use_lora --lora_r 64 --dtype bf16 \
-  --wandb_project dualkl-distill --wandb_name dkl-1.7b-8b-deepmath_sample32k-posdecay \
+  --wandb_project dualkl-distill --wandb_name dkl-1.7b-8b-deepmath_32k-posdecay \
   --teacher_ds_zero3 --gen_micro_batch 2 --lp_micro_batch 2 \
-  --output_dir ./out/dkl-1.7b-8b-deepmath_sample32k-posdecay \
+  --output_dir ./out/dkl-1.7b-8b-deepmath_32k-posdecay \
   --lam_r 1 --lam_f 1 --fkl_pos_decay \
   --use_chat_template
 
-accelerate launch --config_file accelerate_config_multi_4gpu.yaml \
-  -m on_policy_distill.train_on_policy_local \
+### dkl: no-relu-fkl + posdecay
+accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
+  -m dual_kl.train_dualkl_new_4-noclipfkl \
   --student_model Qwen/Qwen3-1.7B-Base --teacher_model Qwen/Qwen3-8B \
   --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 1 \
-  --gen_micro_batch 2 --lp_micro_batch 2 --kl_coef 1.0 --kl_discount 0.0 \
   --max_new_tokens 2048 --max_prompt_tokens 512 --use_lora --lora_r 64 --dtype bf16 \
-  --wandb_project dualkl-distill --wandb_name opd-1.7b-8b-deepmath_32k \
-  --teacher_ds_zero3 --output_dir ./out/opd-1.7b-8b-deepmath_32k \
+  --wandb_project dualkl-distill --wandb_name dkl-1.7b-8b-deepmath_32k-noclipfkl-posdecay \
+  --teacher_ds_zero3 --gen_micro_batch 2 --lp_micro_batch 2 \
+  --output_dir ./out/dkl-1.7b-8b-deepmath_32k-noclipfkl-posdecay \
+  --lam_r 1 --lam_f 1 --fkl_pos_decay \
   --use_chat_template
