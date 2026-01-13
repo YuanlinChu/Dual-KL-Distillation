@@ -1,11 +1,24 @@
 name: dualkl
 channels:
+  - pytorch
+  - nvidia
+  - conda-forge
   - defaults
 dependencies:
   - python=3.11
-  - pytorch
+  - pip
+  # GPU runtime via conda (pulls required CUDA libs)
+  - pytorch=2.5.1
   - pytorch-cuda=12.1
-  - mkl-devel[version='<2024.1']
-  - mkl-include[version='<2024.1']
-  - mkl[version='<2024.1']
-prefix: /hpc2hdd/home/ychu763/anaconda3/envs/dualkl
+  # Common native deps
+  - numpy
+  - ninja
+  # Python packages (pinned where important)
+  - pip:
+      - accelerate==1.11.0
+      - transformers==4.57.1
+      - deepspeed==0.18.2
+      - datasets
+      - peft
+      - safetensors
+      - wandb
