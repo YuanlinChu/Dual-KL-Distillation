@@ -45,7 +45,7 @@ class Config:
     top_p: float = 0.95
     learning_rate: float = 5e-5
     weight_decay: float = 0.0
-    save_every: int = 100
+    save_every: int = 250
     prompts_file: str | None = None
     dataset: str | None = None
     dataset_field: str = "question"
@@ -594,7 +594,7 @@ def parse_args() -> Config:
     p.add_argument("--learning_rate", type=float, default=5e-5)
     p.add_argument("--weight_decay", type=float, default=0.0)
     # rKL/fKL 均为 MC 实现，无需额外开关
-    p.add_argument("--save_every", type=int, default=100)
+    p.add_argument("--save_every", type=int, default=250)
     p.add_argument("--prompts_file", type=str, default=None)
     p.add_argument("--dataset", type=str, default=None)
     p.add_argument(

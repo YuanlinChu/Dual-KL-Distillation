@@ -54,7 +54,7 @@ class Config:
     weight_decay: float = 0.0
     kl_coef: float = 1.0
     kl_discount: float = 0.0
-    save_every: int = 100
+    save_every: int = 250
     prompts_file: str | None = None
     seed: int = 42
     use_lora: bool = False
@@ -678,7 +678,7 @@ def parse_args() -> Config:
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--kl_coef", type=float, default=1.0)
     p.add_argument("--kl_discount", type=float, default=0.0)
-    p.add_argument("--save_every", type=int, default=100)
+    p.add_argument("--save_every", type=int, default=250)
     p.add_argument("--prompts_file", type=str, default=None)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--use_lora", action="store_true")

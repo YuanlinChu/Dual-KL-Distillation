@@ -501,3 +501,89 @@ accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
   --output_dir ./out/dkl-1.7b-8b-deepmath_32k-noclipfkl-posdecay \
   --lam_r 1 --lam_f 1 --fkl_pos_decay \
   --use_chat_template
+
+
+
+### dkl: relu-fkl + no posdecay
+accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
+  -m dual_kl.train_dualkl_new_4 \
+  --student_model /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-1.7B-Base --teacher_model /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-8B \
+  --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 4 \
+  --max_new_tokens 1024 --max_prompt_tokens 512 --use_lora --lora_r 64 --dtype bf16 \
+  --teacher_ds_zero3 --gen_micro_batch 4 --lp_micro_batch 4 \
+  --output_dir ./out/dkl-1.7b-8b-deepmath_32k-no_posdecay \
+  --lam_r 1 --lam_f 1 --use_chat_template --learning_rate 1e-6
+
+### dkl: no-relu-fkl + no-posdecay
+accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
+  -m dual_kl.train_dualkl_new_4_nocilpfkl \
+  --student_model /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-1.7B-Base --teacher_model /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-8B \
+  --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 4 \
+  --max_new_tokens 1024 --max_prompt_tokens 512 --use_lora --lora_r 64 --dtype bf16 \
+  --teacher_ds_zero3 --gen_micro_batch 4 --lp_micro_batch 4 \
+  --output_dir ./out/dkl-1.7b-8b-deepmath_32k-noclipfkl-no_posdecay \
+  --lam_r 1 --lam_f 1  --use_chat_template --learning_rate 1e-6
+
+### dkl: no-relu-fkl + posdecay
+accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
+  -m dual_kl.train_dualkl_new_4_nocilpfkl \
+  --student_model /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-1.7B-Base --teacher_model /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-8B \
+  --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 4 \
+  --max_new_tokens 1024 --max_prompt_tokens 512 --use_lora --lora_r 64 --dtype bf16 \
+  --teacher_ds_zero3 --gen_micro_batch 4 --lp_micro_batch 4 \
+  --output_dir ./out/dkl-1.7b-8b-deepmath_32k-noclipfkl-posdecay \
+  --lam_r 1 --lam_f 1  --use_chat_template --learning_rate 1e-6 --fkl_pos_decay
+
+
+
+CUDA_VISIBLE_DEVICES=0,1 vllm serve /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-1.7B-Base --served-model-name Qwen3-1.7B-Base --tensor-parallel-size 2 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+
+evalscope eval --model Qwen3-1.7B-Base --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 3 --dataset-args "$(cat dataset_args.json)"
+
+
+accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
+  -m on_policy_distill.train_on_policy_local \
+  --student_model /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-1.7B-Base --teacher_model /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-8B \
+  --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 4 \
+  --gen_micro_batch 4 --lp_micro_batch 4 --kl_coef 1.0 --kl_discount 0.0 \
+  --max_new_tokens 1024 --max_prompt_tokens 512 --use_lora --lora_r 64 --dtype bf16 \
+  --swanlab_project dualkl-distill ----swanlab_name opd-1.7b-8b-deepmath_32k \
+  --teacher_ds_zero3 --output_dir ./out/opd-1.7b-8b-deepmath_32k \
+  --use_chat_template --learning_rate 5e-6
+
+accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
+  -m dual_kl.train_dualkl_new_4_swanlab \
+  --student_model /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-1.7B-Base --teacher_model /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-8B \
+  --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 4 \
+  --max_new_tokens 1024 --max_prompt_tokens 512 --use_lora --lora_r 64 --dtype bf16 \
+  --swanlab_project dualkl-distill --swanlab_name dkl-1.7b-8b-deepmath_32k-no_posdecay \
+  --teacher_ds_zero3 --gen_micro_batch 4 --lp_micro_batch 4 \
+  --output_dir ./out/dkl-1.7b-8b-deepmath_32k-no_posdecay \
+  --lam_r 1 --lam_f 1 --use_chat_template --learning_rate 5e-6
+
+
+
+# new-5 非截断 fkl， lam_r=1, lam_f=1， 整体 posdecay， swanlab版本
+## stu模型 qwen3-4b-base  teacher模型 qwen3-8b
+
+### dkl: no-relu-fkl + no-posdecay
+accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
+  -m dual_kl.train_dualkl_new_5 \
+  --student_model /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-4B-Base --teacher_model /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-8B \
+  --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 4 \
+  --max_new_tokens 1024 --max_prompt_tokens 512 --use_lora --lora_r 64 --dtype bf16 \
+  --swanlab_project dualkl-distill --swanlab_name dkl-4b-8b-deepmath_32k-no_posdecay \
+  --teacher_ds_zero3 --gen_micro_batch 4 --lp_micro_batch 4 \
+  --output_dir ./out/dkl-4b-8b-deepmath_32k-no_posdecay \
+  --lam_r 1 --lam_f 1 --use_chat_template --learning_rate 5e-6
+
+### opd
+accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
+  -m on_policy_distill.train_on_policy_local_swanlab \
+  --student_model /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-4B-Base --teacher_model /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-8B \
+  --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 4 \
+  --gen_micro_batch 4 --lp_micro_batch 4 --kl_coef 1.0 --kl_discount 0.0 \
+  --max_new_tokens 1024 --max_prompt_tokens 512 --use_lora --lora_r 64 --dtype bf16 \
+  --swanlab_project dualkl-distill --swanlab_name opd-4b-8b-deepmath_32k \
+  --teacher_ds_zero3 --output_dir ./out/opd-4b-8b-deepmath_32k \
+  --use_chat_template --learning_rate 5e-6
