@@ -46,6 +46,13 @@ try:
 except Exception:
     SWANLAB_AVAILABLE = False
 
+try:
+    from tqdm.auto import tqdm  # type: ignore
+
+    TQDM_AVAILABLE = True
+except Exception:
+    TQDM_AVAILABLE = False
+
 
 @dataclass
 class Config:
@@ -76,6 +83,7 @@ class Config:
     swanlab_project: str | None = None
     swanlab_name: str | None = None
     swanlab_mode: str = "online"
+    progress: bool = True
 
     # Checkpointing
     save_every: int = 50
@@ -335,7 +343,7 @@ def train(cfg: Config) -> None:
         torch_dtype = torch.float16
 
     load_path = cfg.load_checkpoint_path or cfg.model_name
-    model = AutoModelForCausalLM.from_pretrained(load_path, torch_dtype=torch_dtype)
+    model = AutoModelForCausalLM.from_pretrained(load_path, dtype=torch_dtype)
     if cfg.gradient_checkpointing:
         model.gradient_checkpointing_enable()
 
@@ -393,6 +401,9 @@ def train(cfg: Config) -> None:
     )
 
     start_time = time.time()
+    progress_bar = None
+    if accelerator.is_main_process and cfg.progress and TQDM_AVAILABLE:
+        progress_bar = tqdm(total=total_steps, desc="train", dynamic_ncols=True)
     for step in range(1, total_steps + 1):
         optimizer.zero_grad(set_to_none=True)
         step_loss = 0.0
@@ -456,6 +467,10 @@ def train(cfg: Config) -> None:
                 lr,
                 step_tokens,
             )
+            if progress_bar is not None:
+                progress_bar.set_postfix_str(
+                    f"loss={metrics['train/loss']:.4f} lr={lr:.6g} tok={step_tokens}"
+                )
             _append_metrics(log_path, metrics)
             if cfg.swanlab_project:
                 swanlab.log(metrics, step=step)
@@ -467,8 +482,12 @@ def train(cfg: Config) -> None:
             to_save.save_pretrained(ckpt_dir)
             tokenizer.save_pretrained(ckpt_dir)
             logger.info("Saved checkpoint to %s", ckpt_dir)
+        if progress_bar is not None:
+            progress_bar.update(1)
 
     if accelerator.is_main_process:
+        if progress_bar is not None:
+            progress_bar.close()
         to_save = accelerator.unwrap_model(model)
         to_save.save_pretrained(log_path)
         tokenizer.save_pretrained(log_path)
