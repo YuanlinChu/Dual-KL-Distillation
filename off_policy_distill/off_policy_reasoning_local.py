@@ -73,6 +73,7 @@ class Config:
     grad_accum: int = 16
     dtype: str = "bf16"
     gradient_checkpointing: bool = True
+    use_flash_attention: bool = False
 
     # Dataset configuration
     buffer_size: int = 128 * 3000
@@ -343,7 +344,11 @@ def train(cfg: Config) -> None:
         torch_dtype = torch.float16
 
     load_path = cfg.load_checkpoint_path or cfg.model_name
-    model = AutoModelForCausalLM.from_pretrained(load_path, dtype=torch_dtype)
+    attn_impl = "flash_attention_2" if cfg.use_flash_attention else None
+    model = AutoModelForCausalLM.from_pretrained(
+        load_path, dtype=torch_dtype, attn_implementation=attn_impl
+    )
+    model.config.use_cache = False
     if cfg.gradient_checkpointing:
         model.gradient_checkpointing_enable()
 
