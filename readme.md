@@ -587,3 +587,27 @@ accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
   --swanlab_project dualkl-distill --swanlab_name opd-4b-8b-deepmath_32k \
   --teacher_ds_zero3 --output_dir ./out/opd-4b-8b-deepmath_32k \
   --use_chat_template --learning_rate 5e-6
+
+
+CUDA_VISIBLE_DEVICES=0,1 \
+  vllm serve /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-4B-Base \
+  --enable-lora \
+  --lora-modules ${LORA_NAME[$port]}=${LORA_PATH[$port]} \
+  --max-lora-rank ${RANK} \
+  --tensor-parallel-size ${TP} \
+  --trust-remote-code \
+  --max-model-len ${MAX_LEN} \
+  --gpu-memory-utilization ${MEM_UTIL} \
+  --port ${port}"
+
+CUDA_VISIBLE_DEVICES=0,1 vllm serve /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-4B-Base --enable-lora --lora-modules 4b_8b-dkl200_8-sample32k-8192=/home/chuyuanlin.cyl/notebook/Dual-KL-Distillation/out/dkl-4b-8b-deepmath_32k-no_posdecay/step-200 --max-lora-rank 64 --tensor-parallel-size 2 --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+
+CUDA_VISIBLE_DEVICES=2,3 vllm serve /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-4B-Base --enable-lora --lora-modules 4b_8b-dkl500_8-sample32k-8192=/home/chuyuanlin.cyl/notebook/Dual-KL-Distillation/out/dkl-4b-8b-deepmath_32k-no_posdecay/step-500 --max-lora-rank 64 --tensor-parallel-size 2 --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8802
+
+CUDA_VISIBLE_DEVICES=4,5 vllm serve /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-4B-Base --enable-lora --lora-modules 4b_8b-dkl800_8-sample32k-8192=/home/chuyuanlin.cyl/notebook/Dual-KL-Distillation/out/dkl-4b-8b-deepmath_32k-no_posdecay/step-800 --max-lora-rank 64 --tensor-parallel-size 2 --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8803
+
+CUDA_VISIBLE_DEVICES=6,7 vllm serve /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-4B-Base --enable-lora --lora-modules 4b_8b-dkl1000_8-sample32k-8192=/home/chuyuanlin.cyl/notebook/Dual-KL-Distillation/out/dkl-4b-8b-deepmath_32k-no_posdecay/step-1000 --max-lora-rank 64 --tensor-parallel-size 2 --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8804
+
+CUDA_VISIBLE_DEVICES=0,1 vllm serve /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-4B-Base --served-model-name Qwen3-4B-Base --tensor-parallel-size 2 --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+
+evalscope eval --model 4b_8b-dkl200_8-sample32k-8192 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets math_500 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 3 --dataset-args "$(cat dataset_args.json)"

@@ -3,6 +3,14 @@ Local SFT on OpenThoughts3 without Tinker API or tinker_cookbook helpers.
 
 Matches the hyperparameters in off_policy_reasoning.py, but runs training locally
 using Transformers + Accelerate + (optional) LoRA.
+
+accelerate launch --num_processes 8 --mixed_precision bf16 -m off_policy_distill.off_policy_reasoning_local \
+    model_name=/home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-8B-Base \
+    learning_rate=1e-3 \
+    batch_size=128 \
+    lora_rank=128 \
+    swanlab_project=off-policy-distillation
+
 """
 
 from __future__ import annotations
@@ -295,7 +303,7 @@ def _get_log_path(cfg: Config) -> tuple[str, str]:
 
 def train(cfg: Config) -> None:
     torch.manual_seed(cfg.seed)
-    datasets.set_seed(cfg.seed)
+    # datasets.set_seed(cfg.seed) 已移除 - 不再需要，因为 shuffle 已经使用了 seed 参数
 
     if cfg.lr_schedule != "linear":
         raise ValueError("Only lr_schedule=linear is supported in this local script")
@@ -348,7 +356,7 @@ def train(cfg: Config) -> None:
 
     model, optimizer = accelerator.prepare(model, optimizer)
 
-    ds = datasets.load_dataset("open-thoughts/OpenThoughts3-1.2M", split="train", streaming=True)
+    ds = datasets.load_dataset("/home/chuyuanlin.cyl/.cache/modelscope/hub/datasets/open-thoughts/OpenThoughts3-1.2M", split="train", streaming=True)
     ds = ds.shuffle(seed=cfg.seed, buffer_size=cfg.buffer_size)
     if accelerator.num_processes > 1:
         ds = ds.shard(num_shards=accelerator.num_processes, index=accelerator.process_index)

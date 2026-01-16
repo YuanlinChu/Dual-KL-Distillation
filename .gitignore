@@ -5,6 +5,6 @@ swanlab/
 data/DeepMath-32k/
 **/__pycache__/
 lora-vllm.md
-evalscope-test/outputs/
+evalscope-test/outputs*/
 evalscope-test/*.sh
 readme.md
