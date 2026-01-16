@@ -66,7 +66,7 @@ class Config:
     learning_rate: float = 1e-3
     lr_schedule: str = "linear"
     num_epochs: int = 1
-    max_length: int = 16384
+    max_length: int = 8192
 
     # Local training controls
     per_device_batch_size: int = 1
@@ -369,7 +369,7 @@ def train(cfg: Config) -> None:
 
     model, optimizer = accelerator.prepare(model, optimizer)
 
-    ds = datasets.load_dataset("/home/chuyuanlin.cyl/.cache/modelscope/hub/datasets/open-thoughts/OpenThoughts3-1.2M", split="train", streaming=True)
+    ds = datasets.load_dataset("/home/chuyuanlin.cyl/.cache/modelscope/hub/datasets/open-thoughts/OpenThoughts3-1___2M", split="train", streaming=True)
     ds = ds.shuffle(seed=cfg.seed, buffer_size=cfg.buffer_size)
     if accelerator.num_processes > 1:
         ds = ds.shard(num_shards=accelerator.num_processes, index=accelerator.process_index)
