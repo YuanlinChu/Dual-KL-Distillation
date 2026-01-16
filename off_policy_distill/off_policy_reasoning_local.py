@@ -1,5 +1,5 @@
 """
-Local SFT on OpenThoughts3 without Tinker API.
+Local SFT on OpenThoughts3 without Tinker API or tinker_cookbook helpers.
 
 Matches the hyperparameters in off_policy_reasoning.py, but runs training locally
 using Transformers + Accelerate + (optional) LoRA.
@@ -20,12 +20,7 @@ import chz
 import datasets
 import torch
 from accelerate import Accelerator
-from transformers import AutoModelForCausalLM, get_linear_schedule_with_warmup
-
-from tinker_cookbook import cli_utils, model_info, renderers
-from tinker_cookbook.renderers import Message, TrainOnWhat
-from tinker_cookbook.supervised.data import conversation_to_datum
-from tinker_cookbook.tokenizer_utils import get_tokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +44,6 @@ class Config:
     # Model configuration
     model_name: str = "Qwen/Qwen3-8B-Base"
     lora_rank: int = 128
-    renderer_name: str | None = "qwen3"
     load_checkpoint_path: str | None = None
 
     # Training hyperparameters (match off_policy_reasoning.py defaults)
@@ -81,7 +75,11 @@ class Config:
     # Reproducibility
     seed: int = 42
 
-    behavior_if_log_dir_exists: cli_utils.LogdirBehavior = "ask"
+    # Chat formatting
+    use_chat_template: bool = True
+    system_prompt: str | None = None
+
+    behavior_if_log_dir_exists: str = "ask"
 
 
 def ensure_pad_token(tokenizer) -> None:
@@ -101,9 +99,9 @@ def init_swanlab(cfg: Config) -> None:
     swanlab.init(**init_kwargs)
 
 
-def _build_messages_from_row(row: dict) -> list[Message]:
+def _build_messages_from_row(row: dict) -> list[dict]:
     conversations = row.get("conversations", [])
-    messages: list[Message] = [
+    messages = [
         {
             "role": "user" if msg["from"] == "human" else "assistant",
             "content": msg["value"],
@@ -113,22 +111,84 @@ def _build_messages_from_row(row: dict) -> list[Message]:
     return messages
 
 
+def _apply_chat_format(tokenizer, messages: list[dict], system_prompt: str | None) -> str:
+    if system_prompt:
+        messages = [{"role": "system", "content": system_prompt}] + messages
+    if hasattr(tokenizer, "apply_chat_template"):
+        try:
+            return tokenizer.apply_chat_template(messages, tokenize=False)
+        except Exception:
+            pass
+    # Fallback to simple role prefixes
+    parts = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        parts.append(f"{role}: {msg.get('content', '')}")
+    return "\n".join(parts)
+
+
+def _build_input_and_labels(
+    tokenizer,
+    messages: list[dict],
+    max_length: int,
+    use_chat_template: bool,
+    system_prompt: str | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    tokens = []
+    labels = []
+
+    if system_prompt:
+        system_ids = tokenizer.encode(system_prompt, add_special_tokens=False)
+        tokens.extend(system_ids)
+        labels.extend([-100] * len(system_ids))
+
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if use_chat_template:
+            # Render each message in isolation to get role tokens
+            msg_text = _apply_chat_format(tokenizer, [msg], None)
+            msg_ids = tokenizer.encode(msg_text, add_special_tokens=False)
+        else:
+            prefix = f"{role}: "
+            msg_ids = tokenizer.encode(prefix + content, add_special_tokens=False)
+
+        tokens.extend(msg_ids)
+        if role == "assistant":
+            labels.extend(msg_ids)
+        else:
+            labels.extend([-100] * len(msg_ids))
+
+    if max_length is not None and len(tokens) > max_length:
+        tokens = tokens[:max_length]
+        labels = labels[:max_length]
+
+    input_ids = torch.tensor(tokens, dtype=torch.long)
+    label_ids = torch.tensor(labels, dtype=torch.long)
+    weights = (label_ids != -100).float()
+    return input_ids, label_ids, weights
+
+
 def _iter_datums(
     ds: datasets.IterableDataset,
-    renderer: renderers.Renderer,
+    tokenizer,
     max_length: int,
-    train_on_what: TrainOnWhat,
     max_prompts: int,
+    use_chat_template: bool,
+    system_prompt: str | None,
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     count = 0
     for row in ds:
         if count >= max_prompts:
             break
         messages = _build_messages_from_row(row)
-        datum = conversation_to_datum(messages, renderer, max_length, train_on_what)
-        input_ids = torch.tensor(datum.model_input.to_ints(), dtype=torch.long)
-        labels = datum.loss_fn_inputs["target_tokens"].to_torch().long()
-        weights = datum.loss_fn_inputs["weights"].to_torch().float()
+        input_ids, labels, weights = _build_input_and_labels(
+            tokenizer,
+            messages,
+            max_length,
+            use_chat_template,
+            system_prompt,
+        )
         yield input_ids, labels, weights
         count += 1
 
@@ -188,6 +248,36 @@ def _setup_logging(log_path: str) -> None:
     )
 
 
+def _check_log_dir(log_dir: str, behavior_if_exists: str) -> None:
+    if os.path.exists(log_dir):
+        if behavior_if_exists == "delete":
+            logger.info("Log directory %s exists, deleting", log_dir)
+            for root, dirs, files in os.walk(log_dir, topdown=False):
+                for name in files:
+                    os.remove(os.path.join(root, name))
+                for name in dirs:
+                    os.rmdir(os.path.join(root, name))
+            os.rmdir(log_dir)
+        elif behavior_if_exists == "ask":
+            while True:
+                user_input = input(
+                    f"Log directory {log_dir} exists. What to do? [delete, resume, exit]: "
+                )
+                if user_input == "delete":
+                    return _check_log_dir(log_dir, "delete")
+                if user_input == "resume":
+                    return
+                if user_input == "exit":
+                    raise SystemExit(0)
+                logger.warning("Invalid input: %s", user_input)
+        elif behavior_if_exists == "resume":
+            return
+        elif behavior_if_exists == "raise":
+            raise ValueError(f"Log directory {log_dir} already exists")
+        else:
+            raise ValueError(f"Unknown behavior_if_exists: {behavior_if_exists}")
+
+
 def _get_log_path(cfg: Config) -> tuple[str, str]:
     if cfg.log_path is not None:
         log_path = cfg.log_path
@@ -211,7 +301,7 @@ def train(cfg: Config) -> None:
         raise ValueError("Only lr_schedule=linear is supported in this local script")
 
     log_path, run_name = _get_log_path(cfg)
-    cli_utils.check_log_dir(log_path, behavior_if_exists=cfg.behavior_if_log_dir_exists)
+    _check_log_dir(log_path, behavior_if_exists=cfg.behavior_if_log_dir_exists)
     _setup_logging(log_path)
 
     if cfg.num_epochs != 1:
@@ -226,16 +316,10 @@ def train(cfg: Config) -> None:
             os.environ["SWANLAB_MODE"] = cfg.swanlab_mode
         init_swanlab(cfg)
 
-    # Resolve renderer
-    renderer_name = cfg.renderer_name or model_info.get_recommended_renderer_name(cfg.model_name)
-
-    # Tokenizer and renderer
-    tokenizer = get_tokenizer(cfg.model_name)
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, use_fast=True)
     ensure_pad_token(tokenizer)
     tokenizer.padding_side = "right"
-    renderer = renderers.get_renderer(renderer_name, tokenizer=tokenizer)
 
-    # Model
     torch_dtype = None
     if cfg.dtype.lower() == "bf16":
         torch_dtype = torch.bfloat16
@@ -264,7 +348,6 @@ def train(cfg: Config) -> None:
 
     model, optimizer = accelerator.prepare(model, optimizer)
 
-    # Dataset
     ds = datasets.load_dataset("open-thoughts/OpenThoughts3-1.2M", split="train", streaming=True)
     ds = ds.shuffle(seed=cfg.seed, buffer_size=cfg.buffer_size)
     if accelerator.num_processes > 1:
@@ -288,8 +371,14 @@ def train(cfg: Config) -> None:
     logger.info("Total steps: %d", total_steps)
     logger.info("Prompts per rank: %d", max_prompts_per_rank)
 
-    train_on_what = TrainOnWhat.ALL_ASSISTANT_MESSAGES
-    datum_iter = _iter_datums(ds, renderer, cfg.max_length, train_on_what, max_prompts_per_rank)
+    datum_iter = _iter_datums(
+        ds,
+        tokenizer,
+        cfg.max_length,
+        max_prompts_per_rank,
+        cfg.use_chat_template,
+        cfg.system_prompt,
+    )
 
     scheduler = get_linear_schedule_with_warmup(
         optimizer, num_warmup_steps=0, num_training_steps=total_steps
