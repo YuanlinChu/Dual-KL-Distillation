@@ -4,7 +4,7 @@ Local SFT on OpenThoughts3 without Tinker API or tinker_cookbook helpers.
 Matches the hyperparameters in off_policy_reasoning.py, but runs training locally
 using Transformers + Accelerate + (optional) LoRA.
 
-accelerate launch --num_processes 8 --mixed_precision bf16 -m off_policy_distill.off_policy_reasoning_local \
+accelerate launch --num_processes 8 --mixed_precision bf16 -m off_policy_distill.off_policy_reasoning_tinker \
     model_name=/home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-8B-Base \
     learning_rate=1e-3 \
     batch_size=128 \
@@ -30,10 +30,14 @@ import torch
 from accelerate import Accelerator
 from transformers import AutoModelForCausalLM, get_linear_schedule_with_warmup
 
-from ../tinker-cookbook.tinker_cookbook import cli_utils, model_info, renderers
-from ../tinker-cookbook.renderers import Message, TrainOnWhat
-from ../tinker-cookbook.supervised.data import conversation_to_datum
-from ../tinker-cookbook.tokenizer_utils import get_tokenizer
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent / "tinker-cookbook"))
+
+from tinker_cookbook import cli_utils, model_info, renderers
+from tinker_cookbook.renderers import Message, TrainOnWhat
+from tinker_cookbook.supervised.data import conversation_to_datum
+from tinker_cookbook.tokenizer_utils import get_tokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +76,7 @@ class Config:
     learning_rate: float = 1e-3
     lr_schedule: str = "linear"
     num_epochs: int = 1
-    max_length: int = 16384
+    max_length: int = 4096
 
     # Local training controls
     per_device_batch_size: int = 1
@@ -281,7 +285,7 @@ def train(cfg: Config) -> None:
 
     model, optimizer = accelerator.prepare(model, optimizer)
 
-    ds = datasets.load_dataset("/home/chuyuanlin.cyl/.cache/modelscope/hub/datasets/open-thoughts/OpenThoughts3-1.2M", split="train", streaming=True)
+    ds = datasets.load_dataset("/home/chuyuanlin.cyl/.cache/modelscope/hub/datasets/open-thoughts/OpenThoughts3-1___2M", split="train", streaming=True)
     ds = ds.shuffle(seed=cfg.seed, buffer_size=cfg.buffer_size)
     if accelerator.num_processes > 1:
         ds = ds.shard(num_shards=accelerator.num_processes, index=accelerator.process_index)
