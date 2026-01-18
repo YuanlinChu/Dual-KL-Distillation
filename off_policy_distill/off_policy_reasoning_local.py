@@ -5,6 +5,13 @@ Matches the hyperparameters in off_policy_reasoning.py, but runs training locall
 using Transformers + Accelerate + (optional) LoRA.
 
 accelerate launch --num_processes 8 --mixed_precision bf16 -m off_policy_distill.off_policy_reasoning_local \
+    model_name=/home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-4B-Base \
+    learning_rate=1e-3 \
+    batch_size=128 \
+    lora_rank=128 \
+    swanlab_project=off-policy-distillation
+
+accelerate launch --num_processes 8 --mixed_precision bf16 -m off_policy_distill.off_policy_reasoning_local \
     model_name=/home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-8B-Base \
     learning_rate=1e-3 \
     batch_size=128 \
@@ -66,7 +73,7 @@ class Config:
     learning_rate: float = 1e-3
     lr_schedule: str = "linear"
     num_epochs: int = 1
-    max_length: int = 8192
+    max_length: int = 4096
 
     # Local training controls
     per_device_batch_size: int = 1
@@ -87,7 +94,7 @@ class Config:
     progress: bool = True
 
     # Checkpointing
-    save_every: int = 50
+    save_every: int = 500
 
     # Reproducibility
     seed: int = 42

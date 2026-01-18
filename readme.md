@@ -608,6 +608,10 @@ CUDA_VISIBLE_DEVICES=4,5 vllm serve /home/chuyuanlin.cyl/notebook/models/Qwen/Qw
 
 CUDA_VISIBLE_DEVICES=6,7 vllm serve /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-4B-Base --enable-lora --lora-modules 4b_8b-dkl1000_8-sample32k-8192=/home/chuyuanlin.cyl/notebook/Dual-KL-Distillation/out/dkl-4b-8b-deepmath_32k-no_posdecay/step-1000 --max-lora-rank 64 --tensor-parallel-size 2 --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8804
 
-CUDA_VISIBLE_DEVICES=0,1 vllm serve /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-4B-Base --served-model-name Qwen3-4B-Base --tensor-parallel-size 2 --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+CUDA_VISIBLE_DEVICES=4,5,6,7 vllm serve /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-8B-Base --served-model-name Qwen3-8B-Base --tensor-parallel-size 4 --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8802
 
-evalscope eval --model 4b_8b-dkl200_8-sample32k-8192 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets math_500 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 3 --dataset-args "$(cat dataset_args.json)"
+evalscope eval --model Qwen3-8B-Base --api-url http://127.0.0.1:8802/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 3 --dataset-args "$(cat dataset_args.json)"
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-8B-Base --enable-lora --lora-modules 8b_base-sft-3000=/home/chuyuanlin.cyl/tinker-examples/distillation/sft-openthoughts3-local--home-chuyuanlin.cyl-notebook-models-Qwen-Qwen3-8B-Base-128rank-0.001lr-128batch-2026-01-17-02-05/step-3000 --max-lora-rank 128 --tensor-parallel-size 4 --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+
+evalscope eval --model 8b_base-sft-3000 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 3 --dataset-args "$(cat dataset_args.json)"

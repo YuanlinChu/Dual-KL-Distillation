@@ -30,10 +30,10 @@ import torch
 from accelerate import Accelerator
 from transformers import AutoModelForCausalLM, get_linear_schedule_with_warmup
 
-from tinker_cookbook import cli_utils, model_info, renderers
-from tinker_cookbook.renderers import Message, TrainOnWhat
-from tinker_cookbook.supervised.data import conversation_to_datum
-from tinker_cookbook.tokenizer_utils import get_tokenizer
+from ../tinker-cookbook.tinker_cookbook import cli_utils, model_info, renderers
+from ../tinker-cookbook.renderers import Message, TrainOnWhat
+from ../tinker-cookbook.supervised.data import conversation_to_datum
+from ../tinker-cookbook.tokenizer_utils import get_tokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +93,7 @@ class Config:
     progress: bool = True
 
     # Checkpointing
-    save_every: int = 50
+    save_every: int = 500
 
     # Reproducibility
     seed: int = 42
