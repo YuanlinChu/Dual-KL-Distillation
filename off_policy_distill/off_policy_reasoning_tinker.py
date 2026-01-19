@@ -30,10 +30,6 @@ import torch
 from accelerate import Accelerator
 from transformers import AutoModelForCausalLM, get_linear_schedule_with_warmup
 
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent / "tinker-cookbook"))
-
 from tinker_cookbook import cli_utils, model_info, renderers
 from tinker_cookbook.renderers import Message, TrainOnWhat
 from tinker_cookbook.supervised.data import conversation_to_datum
@@ -281,7 +277,13 @@ def train(cfg: Config) -> None:
         )
         model = get_peft_model(model, lora_cfg)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=0.0)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=cfg.learning_rate,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+        weight_decay=0.0,
+    )
 
     model, optimizer = accelerator.prepare(model, optimizer)
 
