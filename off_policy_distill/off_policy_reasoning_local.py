@@ -25,6 +25,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -100,10 +101,11 @@ class Config:
     seed: int = 42
 
     # Chat formatting
-    use_chat_template: bool = True
     system_prompt: str | None = None
 
     behavior_if_log_dir_exists: str = "ask"
+    monitor_every: int = 1
+    monitor_max_chars: int = 400
 
 
 def ensure_pad_token(tokenizer) -> None:
@@ -135,53 +137,45 @@ def _build_messages_from_row(row: dict) -> list[dict]:
     return messages
 
 
-def _apply_chat_format(tokenizer, messages: list[dict], system_prompt: str | None) -> str:
-    if system_prompt:
-        messages = [{"role": "system", "content": system_prompt}] + messages
-    if hasattr(tokenizer, "apply_chat_template"):
-        try:
-            return tokenizer.apply_chat_template(messages, tokenize=False)
-        except Exception:
-            pass
-    # Fallback to simple role prefixes
-    parts = []
-    for msg in messages:
-        role = msg.get("role", "user")
-        parts.append(f"{role}: {msg.get('content', '')}")
-    return "\n".join(parts)
+def _to_id_list(token_ids) -> list[int]:
+    if isinstance(token_ids, torch.Tensor):
+        return token_ids.tolist()
+    return list(token_ids)
+
+
+def _apply_chat_template_with_labels(
+    tokenizer,
+    messages: list[dict],
+    system_prompt: str | None,
+) -> tuple[list[int], list[int]]:
+    if not hasattr(tokenizer, "apply_chat_template"):
+        raise RuntimeError("Tokenizer does not support apply_chat_template; Qwen3 chat template is required.")
+    msg_list = [{"role": "system", "content": system_prompt}] + messages if system_prompt else messages
+    tokens: list[int] = []
+    labels: list[int] = []
+    prev_ids: list[int] = []
+    for i, msg in enumerate(msg_list):
+        prefix_ids = tokenizer.apply_chat_template(
+            msg_list[: i + 1], tokenize=True, add_generation_prompt=False
+        )
+        prefix_ids = _to_id_list(prefix_ids)
+        delta = prefix_ids[len(prev_ids) :]
+        tokens.extend(delta)
+        if msg.get("role") == "assistant":
+            labels.extend(delta)
+        else:
+            labels.extend([-100] * len(delta))
+        prev_ids = prefix_ids
+    return tokens, labels
 
 
 def _build_input_and_labels(
     tokenizer,
     messages: list[dict],
     max_length: int,
-    use_chat_template: bool,
     system_prompt: str | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    tokens = []
-    labels = []
-
-    if system_prompt:
-        system_ids = tokenizer.encode(system_prompt, add_special_tokens=False)
-        tokens.extend(system_ids)
-        labels.extend([-100] * len(system_ids))
-
-    for msg in messages:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        if use_chat_template:
-            # Render each message in isolation to get role tokens
-            msg_text = _apply_chat_format(tokenizer, [msg], None)
-            msg_ids = tokenizer.encode(msg_text, add_special_tokens=False)
-        else:
-            prefix = f"{role}: "
-            msg_ids = tokenizer.encode(prefix + content, add_special_tokens=False)
-
-        tokens.extend(msg_ids)
-        if role == "assistant":
-            labels.extend(msg_ids)
-        else:
-            labels.extend([-100] * len(msg_ids))
+    tokens, labels = _apply_chat_template_with_labels(tokenizer, messages, system_prompt)
 
     if max_length is not None and len(tokens) > max_length:
         tokens = tokens[:max_length]
@@ -198,7 +192,6 @@ def _iter_datums(
     tokenizer,
     max_length: int,
     max_prompts: int,
-    use_chat_template: bool,
     system_prompt: str | None,
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     count = 0
@@ -210,7 +203,6 @@ def _iter_datums(
             tokenizer,
             messages,
             max_length,
-            use_chat_template,
             system_prompt,
         )
         yield input_ids, labels, weights
@@ -317,6 +309,49 @@ def _get_log_path(cfg: Config) -> tuple[str, str]:
     return log_path, run_name
 
 
+def _truncate_text(text: str, max_chars: int) -> str:
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    return text[: max(1, max_chars - 3)] + "..."
+
+
+def _summarize_params(model) -> tuple[float, bool, float, bool]:
+    param_max = 0.0
+    grad_max = 0.0
+    param_finite = True
+    grad_finite = True
+    for p in model.parameters():
+        data = p.detach()
+        if not torch.isfinite(data).all():
+            param_finite = False
+        param_max = max(param_max, data.abs().max().item())
+        if p.grad is None:
+            continue
+        g = p.grad.detach()
+        if not torch.isfinite(g).all():
+            grad_finite = False
+        grad_max = max(grad_max, g.abs().max().item())
+    return param_max, param_finite, grad_max, grad_finite
+
+
+def _decode_sample(
+    tokenizer,
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    max_chars: int,
+) -> tuple[str, str]:
+    try:
+        pred_ids = logits[0].argmax(dim=-1)
+        mask = labels[0].ne(-100)
+        pred = pred_ids[mask].tolist()
+        gold = labels[0][mask].tolist()
+        pred_text = tokenizer.decode(pred, skip_special_tokens=False)
+        gold_text = tokenizer.decode(gold, skip_special_tokens=False)
+        return _truncate_text(pred_text, max_chars), _truncate_text(gold_text, max_chars)
+    except Exception:
+        return "", ""
+
+
 def train(cfg: Config) -> None:
     torch.manual_seed(cfg.seed)
     # datasets.set_seed(cfg.seed) 已移除 - 不再需要，因为 shuffle 已经使用了 seed 参数
@@ -404,7 +439,6 @@ def train(cfg: Config) -> None:
         tokenizer,
         cfg.max_length,
         max_prompts_per_rank,
-        cfg.use_chat_template,
         cfg.system_prompt,
     )
 
@@ -421,6 +455,12 @@ def train(cfg: Config) -> None:
         step_loss = 0.0
         step_tokens = 0
         got_any = False
+        monitor_this_step = (
+            accelerator.is_main_process and cfg.monitor_every > 0 and step % cfg.monitor_every == 0
+        )
+        sample_pred = ""
+        sample_gold = ""
+        sample_logit_max: float | None = None
         for micro_idx in range(cfg.grad_accum):
             batch = []
             for _ in range(cfg.per_device_batch_size):
@@ -449,6 +489,14 @@ def train(cfg: Config) -> None:
                 with accelerator.autocast():
                     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
                     loss = _compute_weighted_nll(outputs.logits, labels, weights)
+                    if monitor_this_step and not sample_pred:
+                        sample_pred, sample_gold = _decode_sample(
+                            tokenizer, outputs.logits.detach(), labels.detach(), cfg.monitor_max_chars
+                        )
+                        try:
+                            sample_logit_max = outputs.logits.detach().abs().max().item()
+                        except Exception:
+                            sample_logit_max = None
                 accelerator.backward(loss)
 
             step_loss += loss.detach().float().item()
@@ -458,7 +506,7 @@ def train(cfg: Config) -> None:
             logger.warning("No more data available; stopping early at step %d", step)
             break
 
-        accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         scheduler.step()
 
@@ -469,8 +517,37 @@ def train(cfg: Config) -> None:
                 "train/loss": step_loss / max(cfg.grad_accum, 1),
                 "train/tokens": step_tokens,
                 "optim/lr": lr,
+                "train/grad_norm": float(grad_norm),
                 "time/elapsed": time.time() - start_time,
             }
+            if monitor_this_step:
+                param_max, param_finite, grad_max, grad_finite = _summarize_params(model)
+                metrics.update(
+                    {
+                        "train/param_max_abs": param_max,
+                        "train/param_is_finite": 1.0 if param_finite else 0.0,
+                        "train/grad_max_abs": grad_max,
+                        "train/grad_is_finite": 1.0 if grad_finite else 0.0,
+                        "train/loss_is_finite": 1.0 if math.isfinite(metrics["train/loss"]) else 0.0,
+                    }
+                )
+                if sample_logit_max is not None:
+                    metrics["train/logit_max_abs"] = float(sample_logit_max)
+                if accelerator.device.type == "cuda":
+                    metrics["train/gpu_mem_mb"] = (
+                        torch.cuda.max_memory_allocated(accelerator.device) / 1024.0 / 1024.0
+                    )
+                if (
+                    not math.isfinite(metrics["train/loss"])
+                    or not param_finite
+                    or not grad_finite
+                ):
+                    logger.warning(
+                        "Non-finite detected | loss_finite=%s param_finite=%s grad_finite=%s",
+                        math.isfinite(metrics["train/loss"]),
+                        param_finite,
+                        grad_finite,
+                    )
             logger.info(
                 "step %d/%d | loss=%.4f | lr=%.6g | tokens=%d",
                 step,
@@ -486,6 +563,11 @@ def train(cfg: Config) -> None:
             _append_metrics(log_path, metrics)
             if cfg.swanlab_project:
                 swanlab.log(metrics, step=step)
+            if monitor_this_step:
+                if sample_pred:
+                    logger.info("sample pred: %s", sample_pred)
+                if sample_gold:
+                    logger.info("sample gold: %s", sample_gold)
 
         if accelerator.is_main_process and cfg.save_every > 0 and step % cfg.save_every == 0:
             ckpt_dir = os.path.join(log_path, f"step-{step}")
