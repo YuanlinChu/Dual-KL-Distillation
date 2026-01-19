@@ -1,11 +1,27 @@
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM
 from peft import PeftModel
+from tinker_cookbook.tokenizer_utils import get_tokenizer
+from tinker_cookbook import renderers
 
-base = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-8B-Base", torch_dtype="auto", device_map="auto")
-tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B-Base")
+model_name = "Qwen/Qwen3-8B-Base"
+adapter_path = "/path/to/adapter"  # 训练输出目录
 
-model = PeftModel.from_pretrained(base, "/path/to/adapter")  # 训练输出目录
-prompt = "...你的问题..."
-inputs = tok(prompt, return_tensors="pt").to(model.device)
-out = model.generate(**inputs, max_new_tokens=200)
-print(tok.decode(out[0], skip_special_tokens=True))
+base = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype="auto", device_map="auto")
+model = PeftModel.from_pretrained(base, adapter_path)
+
+tokenizer = get_tokenizer(model_name)
+renderer = renderers.get_renderer("qwen3", tokenizer=tokenizer)
+
+question = "你的问题..."
+messages = [{"role": "user", "content": question}]
+model_input = renderer.build_generation_prompt(messages)
+input_ids = model_input.to_ints()
+
+import torch
+inputs = torch.tensor([input_ids], device=model.device)
+out = model.generate(
+    input_ids=inputs,
+    do_sample=False,  # 先用确定性生成排查
+    max_new_tokens=200,
+)
+print(tokenizer.decode(out[0], skip_special_tokens=True))
