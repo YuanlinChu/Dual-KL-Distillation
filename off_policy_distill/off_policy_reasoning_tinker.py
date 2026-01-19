@@ -30,6 +30,10 @@ import torch
 from accelerate import Accelerator
 from transformers import AutoModelForCausalLM, get_linear_schedule_with_warmup
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent / "tinker-cookbook"))
+
 from tinker_cookbook import cli_utils, model_info, renderers
 from tinker_cookbook.renderers import Message, TrainOnWhat
 from tinker_cookbook.supervised.data import conversation_to_datum

@@ -612,6 +612,19 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 vllm serve /home/chuyuanlin.cyl/notebook/models/Qwe
 
 evalscope eval --model Qwen3-8B-Base --api-url http://127.0.0.1:8802/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 3 --dataset-args "$(cat dataset_args.json)"
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-8B-Base --enable-lora --lora-modules 8b_base-sft-3000=/home/chuyuanlin.cyl/tinker-examples/distillation/sft-openthoughts3-local--home-chuyuanlin.cyl-notebook-models-Qwen-Qwen3-8B-Base-128rank-0.001lr-128batch-2026-01-17-02-05/step-3000 --max-lora-rank 128 --tensor-parallel-size 4 --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-8B-Base --enable-lora --lora-modules 8b_base-sft-2000=/home/chuyuanlin.cyl/tinker-examples/distillation/sft-openthoughts3-local--home-chuyuanlin.cyl-notebook-models-Qwen-Qwen3-8B-Base-128rank-0.001lr-128batch-2026-01-18-22-08/step-2000 --max-lora-rank 128 --tensor-parallel-size 4 --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
 
-evalscope eval --model 8b_base-sft-3000 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 3 --dataset-args "$(cat dataset_args.json)"
+evalscope eval --model 8b_base-sft-2000 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 3 --dataset-args "$(cat dataset_args.json)"
+
+
+python merge_lora.py \
+--base /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-8B-Base \
+--adapter /home/chuyuanlin.cyl/tinker-examples/distillation/sft-openthoughts3-local--home-chuyuanlin.cyl-notebook-models-Qwen-Qwen3-8B-Base-128rank-0.001lr-128batch-2026-01-18-22-08/step-2000 \
+--out /home/chuyuanlin.cyl/tinker-examples/distillation/8b-sft-2000-merged \
+--dtype bf16 --device_map auto --safe
+
+/home/chuyuanlin.cyl/tinker-examples/distillation/8b-sft-2000-merged
+
+CUDA_VISIBLE_DEVICES=4,5,6,7 vllm serve /home/chuyuanlin.cyl/tinker-examples/distillation/8b-sft-2000-merged --served-model-name 8b-sft-2000 --tensor-parallel-size 4 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8802
+
+evalscope eval --model 8b-sft-2000 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 3 --dataset-args "$(cat dataset_args.json)"
