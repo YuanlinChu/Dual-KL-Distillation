@@ -305,7 +305,7 @@ def _get_log_path(cfg: Config) -> tuple[str, str]:
             f"{cfg.lora_rank}rank-{cfg.learning_rate}lr-"
             f"{cfg.batch_size}batch-{datetime.now().strftime('%Y-%m-%d-%H-%M')}"
         )
-        log_path = os.path.expanduser(f"~/tinker-examples/distillation/{run_name}")
+        log_path = os.path.expanduser(f"~/out/off-policy/{run_name}")
     return log_path, run_name
 
 
