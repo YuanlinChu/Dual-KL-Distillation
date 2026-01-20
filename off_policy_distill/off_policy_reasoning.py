@@ -239,6 +239,7 @@ def _setup_logging(log_path: str) -> None:
             logging.FileHandler(os.path.join(log_path, "train.log")),
         ],
     )
+    logging.getLogger("tinker_cookbook.renderers.base").setLevel(logging.ERROR)
 
 
 def _check_log_dir(log_dir: str, behavior_if_exists: str) -> None:
