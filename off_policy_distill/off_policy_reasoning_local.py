@@ -488,19 +488,23 @@ def train(cfg: Config) -> None:
             with sync_context:
                 with accelerator.autocast():
                     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                    loss = _compute_weighted_nll(outputs.logits, labels, weights)
+                    # Shift for next-token prediction to match standard causal LM training.
+                    logits = outputs.logits[:, :-1, :]
+                    shift_labels = labels[:, 1:]
+                    shift_weights = weights[:, 1:]
+                    loss = _compute_weighted_nll(logits, shift_labels, shift_weights)
                     if monitor_this_step and not sample_pred:
                         sample_pred, sample_gold = _decode_sample(
-                            tokenizer, outputs.logits.detach(), labels.detach(), cfg.monitor_max_chars
+                            tokenizer, logits.detach(), shift_labels.detach(), cfg.monitor_max_chars
                         )
                         try:
-                            sample_logit_max = outputs.logits.detach().abs().max().item()
+                            sample_logit_max = logits.detach().abs().max().item()
                         except Exception:
                             sample_logit_max = None
                 accelerator.backward(loss)
 
             step_loss += loss.detach().float().item()
-            step_tokens += int(weights.sum().item())
+            step_tokens += int(shift_weights.sum().item())
 
         if not got_any:
             logger.warning("No more data available; stopping early at step %d", step)
