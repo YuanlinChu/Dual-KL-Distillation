@@ -407,7 +407,13 @@ def train(cfg: Config) -> None:
         )
         model = get_peft_model(model, lora_cfg)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=0.0)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=cfg.learning_rate,
+        weight_decay=0.0,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+    )
 
     model, optimizer = accelerator.prepare(model, optimizer)
 
