@@ -474,19 +474,15 @@ def train(cfg: Config) -> None:
                 with accelerator.autocast():
                     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
 
-                    # Shift for next-token prediction (standard causal LM training)
-                    logits = outputs.logits[:, :-1, :]
-                    shift_labels = labels[:, 1:]
-                    shift_weights = weights[:, 1:]
-
-                    loss = _compute_weighted_nll(logits, shift_labels, shift_weights)
+                    loss_raw = _compute_weighted_nll(outputs.logits, labels, weights)
+                    loss = loss_raw / max(accelerator.gradient_accumulation_steps, 1)
 
                     if monitor_this_step and not sample_pred:
                         sample_pred, sample_gold = _decode_sample(
-                            tokenizer, logits.detach(), shift_labels.detach(), cfg.monitor_max_chars
+                            tokenizer, outputs.logits.detach(), labels.detach(), cfg.monitor_max_chars
                         )
                         try:
-                            sample_logit_max = logits.detach().abs().max().item()
+                            sample_logit_max = outputs.logits.detach().abs().max().item()
                         except Exception:
                             sample_logit_max = None
 
@@ -502,12 +498,12 @@ def train(cfg: Config) -> None:
                     if progress_bar is not None:
                         progress_bar.update(1)
 
-            step_loss += loss.detach().float().item()
+            step_loss += loss_raw.detach().float().item()
             micro_count += 1
-            step_tokens += int(shift_weights.sum().item())
+            step_tokens += int(weights.sum().item())
 
         if not got_any:
-            logger.warning("No more data available; stopping early at step %d", step)
+            logger.warning("No more data available; stopping early at step %d", opt_step)
             break
         if got_any and not did_step:
             logger.warning(
