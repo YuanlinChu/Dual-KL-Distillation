@@ -427,21 +427,26 @@ def train(cfg: Config) -> None:
         cfg.system_prompt,
     )
 
+    warmup_steps = max(10, int(0.03 * total_steps))
     scheduler = get_linear_schedule_with_warmup(
-        optimizer, num_warmup_steps=0, num_training_steps=total_steps
+        optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
     )
 
     start_time = time.time()
     progress_bar = None
     if accelerator.is_main_process and cfg.progress and TQDM_AVAILABLE:
         progress_bar = tqdm(total=total_steps, desc="train", dynamic_ncols=True)
-    for step in range(1, total_steps + 1):
+    opt_step = 0  # real optimizer steps (真实更新步数)
+    while opt_step < total_steps:
         optimizer.zero_grad(set_to_none=True)
         step_loss = 0.0
+        micro_count = 0
         step_tokens = 0
         got_any = False
+        did_step = False
+        grad_norm = float("nan")
         monitor_this_step = (
-            accelerator.is_main_process and cfg.monitor_every > 0 and step % cfg.monitor_every == 0
+            accelerator.is_main_process and cfg.monitor_every > 0 and (opt_step + 1) % cfg.monitor_every == 0
         )
         sample_pred = ""
         sample_gold = ""
@@ -465,41 +470,57 @@ def train(cfg: Config) -> None:
             weights = weights.to(accelerator.device)
             attention_mask = attention_mask.to(accelerator.device)
 
-            sync_context = (
-                accelerator.no_sync(model)
-                if micro_idx < cfg.grad_accum - 1
-                else contextlib.nullcontext()
-            )
-            with sync_context:
+            with accelerator.accumulate(model):
                 with accelerator.autocast():
                     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                    loss = _compute_weighted_nll(outputs.logits, labels, weights)
+
+                    # Shift for next-token prediction (standard causal LM training)
+                    logits = outputs.logits[:, :-1, :]
+                    shift_labels = labels[:, 1:]
+                    shift_weights = weights[:, 1:]
+
+                    loss = _compute_weighted_nll(logits, shift_labels, shift_weights)
+
                     if monitor_this_step and not sample_pred:
                         sample_pred, sample_gold = _decode_sample(
-                            tokenizer, outputs.logits.detach(), labels.detach(), cfg.monitor_max_chars
+                            tokenizer, logits.detach(), shift_labels.detach(), cfg.monitor_max_chars
                         )
                         try:
-                            sample_logit_max = outputs.logits.detach().abs().max().item()
+                            sample_logit_max = logits.detach().abs().max().item()
                         except Exception:
                             sample_logit_max = None
+
                 accelerator.backward(loss)
 
+                if accelerator.sync_gradients:
+                    grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    did_step = True
+                    opt_step += 1
+                    if progress_bar is not None:
+                        progress_bar.update(1)
+
             step_loss += loss.detach().float().item()
-            step_tokens += int(weights.sum().item())
+            micro_count += 1
+            step_tokens += int(shift_weights.sum().item())
 
         if not got_any:
             logger.warning("No more data available; stopping early at step %d", step)
             break
-
-        grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        scheduler.step()
+        if got_any and not did_step:
+            logger.warning(
+                "Insufficient micro-batches to complete an optimizer step; stopping at opt_step %d",
+                opt_step,
+            )
+            break
 
         if accelerator.is_main_process:
             lr = scheduler.get_last_lr()[0]
             metrics = {
-                "step": step,
-                "train/loss": step_loss / max(cfg.grad_accum, 1),
+                "step": opt_step,
+                "train/loss": step_loss / max(micro_count, 1),
                 "train/tokens": step_tokens,
                 "optim/lr": lr,
                 "train/grad_norm": float(grad_norm),
@@ -535,7 +556,7 @@ def train(cfg: Config) -> None:
                     )
             logger.info(
                 "step %d/%d | loss=%.4f | lr=%.6g | tokens=%d",
-                step,
+                opt_step,
                 total_steps,
                 metrics["train/loss"],
                 lr,
@@ -547,22 +568,20 @@ def train(cfg: Config) -> None:
                 )
             _append_metrics(log_path, metrics)
             if cfg.swanlab_project:
-                swanlab.log(metrics, step=step)
+                swanlab.log(metrics, step=opt_step)
             if monitor_this_step:
                 if sample_pred:
                     logger.info("sample pred: %s", sample_pred)
                 if sample_gold:
                     logger.info("sample gold: %s", sample_gold)
 
-        if accelerator.is_main_process and cfg.save_every > 0 and step % cfg.save_every == 0:
-            ckpt_dir = os.path.join(log_path, f"step-{step}")
+        if accelerator.is_main_process and cfg.save_every > 0 and opt_step > 0 and opt_step % cfg.save_every == 0:
+            ckpt_dir = os.path.join(log_path, f"step-{opt_step}")
             os.makedirs(ckpt_dir, exist_ok=True)
             to_save = accelerator.unwrap_model(model)
             to_save.save_pretrained(ckpt_dir)
             tokenizer.save_pretrained(ckpt_dir)
             logger.info("Saved checkpoint to %s", ckpt_dir)
-        if progress_bar is not None:
-            progress_bar.update(1)
 
     if accelerator.is_main_process:
         if progress_bar is not None:
