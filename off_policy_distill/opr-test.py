@@ -4,14 +4,14 @@ Local SFT on OpenThoughts3 without Tinker API or tinker_cookbook helpers.
 Matches the hyperparameters in off_policy_reasoning.py, but runs training locally
 using Transformers + Accelerate + (optional) LoRA.
 
-accelerate launch --num_processes 8 --mixed_precision bf16 -m off_policy_distill.off_policy_reasoning_tinker \
+accelerate launch --num_processes 8 --mixed_precision bf16 -m off_policy_distill.off_policy_reasoning_local \
     model_name=/home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-4B-Base \
     learning_rate=1e-3 \
     batch_size=128 \
     lora_rank=128 \
     swanlab_project=off-policy-distillation
 
-accelerate launch --num_processes 8 --mixed_precision bf16 -m off_policy_distill.off_policy_reasoning_tinker \
+accelerate launch --num_processes 8 --mixed_precision bf16 -m off_policy_distill.off_policy_reasoning_local \
     model_name=/home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-8B-Base \
     learning_rate=1e-3 \
     batch_size=128 \
@@ -37,6 +37,10 @@ import datasets
 import torch
 from accelerate import Accelerator
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
+
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent / "tinker-cookbook"))
 
 from tinker_cookbook import renderers
 from tinker_cookbook.supervised.common import datum_from_model_input_weights
@@ -235,6 +239,7 @@ def _setup_logging(log_path: str) -> None:
             logging.FileHandler(os.path.join(log_path, "train.log")),
         ],
     )
+    logging.getLogger("tinker_cookbook.renderers.base").setLevel(logging.ERROR)
 
 
 def _check_log_dir(log_dir: str, behavior_if_exists: str) -> None:
@@ -381,7 +386,13 @@ def train(cfg: Config) -> None:
         )
         model = get_peft_model(model, lora_cfg)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=0.0)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=cfg.learning_rate,
+        weight_decay=0.0,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+    )
 
     model, optimizer = accelerator.prepare(model, optimizer)
 
@@ -416,21 +427,26 @@ def train(cfg: Config) -> None:
         cfg.system_prompt,
     )
 
+    warmup_steps = max(10, int(0.03 * total_steps))
     scheduler = get_linear_schedule_with_warmup(
-        optimizer, num_warmup_steps=0, num_training_steps=total_steps
+        optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
     )
 
     start_time = time.time()
     progress_bar = None
     if accelerator.is_main_process and cfg.progress and TQDM_AVAILABLE:
         progress_bar = tqdm(total=total_steps, desc="train", dynamic_ncols=True)
-    for step in range(1, total_steps + 1):
+    opt_step = 0  # real optimizer steps (真实更新步数)
+    while opt_step < total_steps:
         optimizer.zero_grad(set_to_none=True)
         step_loss = 0.0
+        micro_count = 0
         step_tokens = 0
         got_any = False
+        did_step = False
+        grad_norm = float("nan")
         monitor_this_step = (
-            accelerator.is_main_process and cfg.monitor_every > 0 and step % cfg.monitor_every == 0
+            accelerator.is_main_process and cfg.monitor_every > 0 and (opt_step + 1) % cfg.monitor_every == 0
         )
         sample_pred = ""
         sample_gold = ""
@@ -454,15 +470,13 @@ def train(cfg: Config) -> None:
             weights = weights.to(accelerator.device)
             attention_mask = attention_mask.to(accelerator.device)
 
-            sync_context = (
-                accelerator.no_sync(model)
-                if micro_idx < cfg.grad_accum - 1
-                else contextlib.nullcontext()
-            )
-            with sync_context:
+            with accelerator.accumulate(model):
                 with accelerator.autocast():
                     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                    loss = _compute_weighted_nll(outputs.logits, labels, weights)
+
+                    loss_raw = _compute_weighted_nll(outputs.logits, labels, weights)
+                    loss = loss_raw / max(accelerator.gradient_accumulation_steps, 1)
+
                     if monitor_this_step and not sample_pred:
                         sample_pred, sample_gold = _decode_sample(
                             tokenizer, outputs.logits.detach(), labels.detach(), cfg.monitor_max_chars
@@ -471,24 +485,65 @@ def train(cfg: Config) -> None:
                             sample_logit_max = outputs.logits.detach().abs().max().item()
                         except Exception:
                             sample_logit_max = None
+                        try:
+                            input_cpu = input_ids[0].detach().cpu()
+                            label_cpu = labels[0].detach().cpu()
+                            weight_cpu = weights[0].detach().cpu()
+                            align_mask = weight_cpu[:-1] > 0
+                            if bool(align_mask.any()):
+                                align_ratio = (
+                                    (label_cpu[:-1][align_mask] == input_cpu[1:][align_mask])
+                                    .float()
+                                    .mean()
+                                    .item()
+                                )
+                                logger.info(
+                                    "alignment check: ratio=%.4f over %d tokens",
+                                    align_ratio,
+                                    int(align_mask.sum().item()),
+                                )
+                                idxs = torch.nonzero(align_mask).flatten()[:3].tolist()
+                                for idx in idxs:
+                                    logger.info(
+                                        "align sample idx=%d input=%d label=%d",
+                                        idx,
+                                        int(input_cpu[idx].item()),
+                                        int(label_cpu[idx].item()),
+                                    )
+                        except Exception:
+                            logger.exception("Alignment debug check failed")
+
                 accelerator.backward(loss)
 
-            step_loss += loss.detach().float().item()
+                if accelerator.sync_gradients:
+                    grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    did_step = True
+                    opt_step += 1
+                    if progress_bar is not None:
+                        progress_bar.update(1)
+
+            step_loss += loss_raw.detach().float().item()
+            micro_count += 1
             step_tokens += int(weights.sum().item())
 
         if not got_any:
-            logger.warning("No more data available; stopping early at step %d", step)
+            logger.warning("No more data available; stopping early at step %d", opt_step)
             break
-
-        grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        scheduler.step()
+        if got_any and not did_step:
+            logger.warning(
+                "Insufficient micro-batches to complete an optimizer step; stopping at opt_step %d",
+                opt_step,
+            )
+            break
 
         if accelerator.is_main_process:
             lr = scheduler.get_last_lr()[0]
             metrics = {
-                "step": step,
-                "train/loss": step_loss / max(cfg.grad_accum, 1),
+                "step": opt_step,
+                "train/loss": step_loss / max(micro_count, 1),
                 "train/tokens": step_tokens,
                 "optim/lr": lr,
                 "train/grad_norm": float(grad_norm),
@@ -524,7 +579,7 @@ def train(cfg: Config) -> None:
                     )
             logger.info(
                 "step %d/%d | loss=%.4f | lr=%.6g | tokens=%d",
-                step,
+                opt_step,
                 total_steps,
                 metrics["train/loss"],
                 lr,
@@ -536,22 +591,20 @@ def train(cfg: Config) -> None:
                 )
             _append_metrics(log_path, metrics)
             if cfg.swanlab_project:
-                swanlab.log(metrics, step=step)
+                swanlab.log(metrics, step=opt_step)
             if monitor_this_step:
                 if sample_pred:
                     logger.info("sample pred: %s", sample_pred)
                 if sample_gold:
                     logger.info("sample gold: %s", sample_gold)
 
-        if accelerator.is_main_process and cfg.save_every > 0 and step % cfg.save_every == 0:
-            ckpt_dir = os.path.join(log_path, f"step-{step}")
+        if accelerator.is_main_process and cfg.save_every > 0 and opt_step > 0 and opt_step % cfg.save_every == 0:
+            ckpt_dir = os.path.join(log_path, f"step-{opt_step}")
             os.makedirs(ckpt_dir, exist_ok=True)
             to_save = accelerator.unwrap_model(model)
             to_save.save_pretrained(ckpt_dir)
             tokenizer.save_pretrained(ckpt_dir)
             logger.info("Saved checkpoint to %s", ckpt_dir)
-        if progress_bar is not None:
-            progress_bar.update(1)
 
     if accelerator.is_main_process:
         if progress_bar is not None:
