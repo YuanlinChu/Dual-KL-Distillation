@@ -2,10 +2,10 @@
 Check OpenThoughts3 token lengths and truncation impact under the local SFT pipeline.
 
 Example:
-  python tinker_cookbook/scripts/check_openthoughts_lengths.py \
-    --dataset open-thoughts/OpenThoughts3-1.2M \
+  python data/check_openthoughts_lengths.py \
+    --dataset /home/chuyuanlin.cyl/.cache/modelscope/hub/datasets/open-thoughts/OpenThoughts3-1___2M \
     --split train \
-    --model-name Qwen/Qwen3-8B-Base \
+    --model-name /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-8B-Base \
     --renderer-name qwen3 \
     --max-length 4096 \
     --num-samples 1000
@@ -20,6 +20,10 @@ from typing import Iterable
 
 import datasets
 from transformers import AutoTokenizer
+
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent / "tinker-cookbook"))
 
 from tinker_cookbook import renderers
 from tinker_cookbook.supervised.common import datum_from_model_input_weights

@@ -4,14 +4,14 @@ Local SFT on OpenThoughts3 without Tinker API or tinker_cookbook helpers.
 Matches the hyperparameters in off_policy_reasoning.py, but runs training locally
 using Transformers + Accelerate + (optional) LoRA.
 
-accelerate launch --num_processes 8 --mixed_precision bf16 -m off_policy_distill.off_policy_reasoning_local \
+accelerate launch --num_processes 8 --mixed_precision bf16 -m off_policy_distill.opr-test \
     model_name=/home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-4B-Base \
     learning_rate=1e-3 \
     batch_size=128 \
     lora_rank=128 \
     swanlab_project=off-policy-distillation
 
-accelerate launch --num_processes 8 --mixed_precision bf16 -m off_policy_distill.off_policy_reasoning_local \
+accelerate launch --num_processes 8 --mixed_precision bf16 -m off_policy_distill.opr-test \
     model_name=/home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-8B-Base \
     learning_rate=1e-3 \
     batch_size=128 \

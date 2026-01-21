@@ -9,7 +9,7 @@ from tinker_cookbook.tokenizer_utils import get_tokenizer
 from tinker_cookbook import renderers
 
 model_name = "/home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-4B-Base"
-adapter_path = "/home/chuyuanlin.cyl/tinker-examples/distillation/sft-openthoughts3-local--home-chuyuanlin.cyl-notebook-models-Qwen-Qwen3-4B-Base-128rank-0.001lr-128batch-2026-01-18-22-15/step-3000"  # 训练输出目录
+adapter_path = "/home/chuyuanlin.cyl/out/off-policy/sft-openthoughts3-local--home-chuyuanlin.cyl-notebook-models-Qwen-Qwen3-4B-Base-128rank-0.001lr-128batch-2026-01-20-19-49/step-3000"  # 训练输出目录
 
 base = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype="auto", device_map="auto")
 model = PeftModel.from_pretrained(base, adapter_path)
