@@ -241,13 +241,14 @@ def generate_continuations(
             chunk = prompts[i : i + max(1, micro_batch)]
             batch = tok(chunk, return_tensors="pt", padding=True, truncation=True)
             batch = {k: v.to(device_of(model_for_gen)) for k, v in batch.items()}
-            max_len = int(max_tokens)
-            if batch["input_ids"].size(1) >= max_len:
-                max_len = batch["input_ids"].size(1)
+
+            prompt_len = batch["input_ids"].size(1)
+            max_new = max(max_tokens - prompt_len, 128)
+
             gen = model_for_gen.generate(
                 **batch,
                 do_sample=True,
-                max_length=max_len,
+                max_new_tokens=max_new,
                 temperature=temperature,
                 top_p=top_p,
                 pad_token_id=pad_id,

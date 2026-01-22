@@ -37,13 +37,13 @@ class Config:
     student_model: str
     teacher_model: str
     output_dir: str
-    steps: int = 1000
-    batch_size: int = 2
-    group_size: int = 1
-    max_new_tokens: int = 128
-    temperature: float = 0.8
-    top_p: float = 0.95
-    learning_rate: float = 5e-5
+    steps: int = 150
+    batch_size: int = 32
+    group_size: int = 4
+    max_new_tokens: int = 4096
+    temperature: float = 1.0
+    top_p: float = 1
+    learning_rate: float = 1e-4
     weight_decay: float = 0.0
     save_every: int = 250
     prompts_file: str | None = None
@@ -56,7 +56,7 @@ class Config:
     lora_alpha: int = 16
     lora_dropout: float = 0.05
     dtype: str = "bf16"
-    grad_accum: int = 1
+    grad_accum: int = 16
     eval_every: int = 100
     swanlab_project: str | None = None
     swanlab_name: str | None = None
@@ -65,8 +65,8 @@ class Config:
     teacher_ds_zero3: bool = False
     teacher_ds_config: str | None = None
     # Micro-batching
-    gen_micro_batch: int = 8
-    lp_micro_batch: int = 8
+    gen_micro_batch: int = 1
+    lp_micro_batch: int = 1
     # Progress
     progress: bool = True
     # Fixed weights (0..1); in this variant rKL is fixed to 1.0 during training

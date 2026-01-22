@@ -13,7 +13,7 @@ Example (8 GPUs, CP=4, DP=2):
     --global-batch-size 2 \
     --seq-length 16384 \
     --max-position-embeddings 16384 \
-    --model-name Qwen/Qwen3-8B-Base \
+    --model-name /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-8B-Base \
     --dataset-path /home/chuyuanlin.cyl/.cache/modelscope/hub/datasets/open-thoughts/OpenThoughts3-1___2M \
     --renderer-name qwen3 \
     --max-prompts 384000 \
