@@ -61,6 +61,7 @@ class Config:
     eval_exact_kl: bool = True
     print_sample: bool = True
     print_every: int = 1
+    debug_mask: bool = False
     swanlab_project: str | None = None
     swanlab_name: str | None = None
     swanlab_mode: str = "online"
@@ -304,6 +305,36 @@ def train_step(
             cont_s[i, start:] = True
     valid_s_cpu = cont_s & am_s_cpu[:, 1:]
     tokens_s = int(valid_s_cpu.sum().item())
+    if cfg.debug_mask and accelerator.is_main_process and B_s > 0:
+        prompt0 = prompts[0]
+        prompt_ids = tok(prompt0, return_tensors="pt", truncation=True)["input_ids"][0].cpu()
+        prompt_len = int(prompt_ids.numel())
+        nonpad = am_s_cpu[0].nonzero()
+        if len(nonpad) == 0:
+            raise RuntimeError("debug_mask: sample has no non-pad tokens")
+        first_nonpad = int(nonpad[0].item())
+        seq_len = int(seq_std_cpu.size(1))
+        if first_nonpad + prompt_len > seq_len:
+            raise RuntimeError(
+                f"debug_mask: prompt slice out of range: first_nonpad={first_nonpad}, "
+                f"prompt_len={prompt_len}, seq_len={seq_len}"
+            )
+        seq_prompt = seq_std_cpu[0, first_nonpad : first_nonpad + prompt_len]
+        if not torch.equal(seq_prompt.cpu(), prompt_ids):
+            raise RuntimeError(
+                "debug_mask: prompt ids do not match sequence slice. "
+                f"first_nonpad={first_nonpad}, prompt_len={prompt_len}"
+            )
+        cont_idx = cont_s[0].nonzero()
+        if len(cont_idx) == 0:
+            raise RuntimeError("debug_mask: continuation mask has no True values")
+        first_true = int(cont_idx[0].item())
+        expected_start = max(first_nonpad + prompt_len - 1, 0)
+        if first_true != expected_start:
+            raise RuntimeError(
+                "debug_mask: continuation start mismatch. "
+                f"first_true={first_true}, expected_start={expected_start}"
+            )
     sample_text = ""
     if B_s > 0:
         ids_0 = seq_std_cpu[0]
@@ -667,6 +698,7 @@ def parse_args() -> Config:
     p.add_argument("--no_eval_exact_kl", action="store_true")
     p.add_argument("--no_print_sample", action="store_true")
     p.add_argument("--print_every", type=int, default=1)
+    p.add_argument("--debug_mask", action="store_true")
     p.add_argument("--swanlab_project", type=str, default=None)
     p.add_argument("--swanlab_name", type=str, default=None)
     p.add_argument("--swanlab_mode", type=str, default="online", choices=["online", "offline", "disabled"])
@@ -714,6 +746,7 @@ def parse_args() -> Config:
         eval_exact_kl=not a.no_eval_exact_kl,
         print_sample=not a.no_print_sample,
         print_every=a.print_every,
+        debug_mask=bool(a.debug_mask),
         swanlab_project=a.swanlab_project,
         swanlab_name=a.swanlab_name,
         swanlab_mode=a.swanlab_mode,
