@@ -335,23 +335,31 @@ def train_step(
                 "debug_mask: continuation start mismatch. "
                 f"first_true={first_true}, expected_start={expected_start}"
             )
-    sample_text = ""
+    sample_full = ""
+    sample_prompt = ""
+    sample_cont = ""
     if B_s > 0:
         ids_0 = seq_std_cpu[0]
         nonpad = ids_0.ne(pad_id).nonzero()
         if len(nonpad) > 0:
             first_nonpad = int(nonpad[0].item())
             end = int(nonpad[-1].item() + 1)
-            start = max(first_nonpad + plen_s[0], 0)
-            if end > start:
-                sample_text = tok.decode(ids_0[start:end].tolist())
+            prompt_start = first_nonpad
+            prompt_end = max(first_nonpad + plen_s[0], prompt_start)
+            sample_full = tok.decode(ids_0[prompt_start:end].tolist())
+            if prompt_end > prompt_start:
+                sample_prompt = tok.decode(ids_0[prompt_start:prompt_end].tolist())
+            if end > prompt_end:
+                sample_cont = tok.decode(ids_0[prompt_end:end].tolist())
     if tokens_s == 0:
         return {
             "loss": 0.0,
             "lambda": 0.0,
             "rkl_metric": 0.0,
             "tokens": 0,
-            "sample_text": sample_text,
+            "sample_full": sample_full,
+            "sample_prompt": sample_prompt,
+            "sample_cont": sample_cont,
         }
 
     teacher.eval()
@@ -445,7 +453,9 @@ def train_step(
         "rkl_metric": float(rkl_mean),
         "fkl_metric": float(fkl_mean),
         "tokens": tokens,
-        "sample_text": sample_text,
+        "sample_full": sample_full,
+        "sample_prompt": sample_prompt,
+        "sample_cont": sample_cont,
     }
 
 
@@ -547,9 +557,20 @@ def main(cfg: Config) -> None:
         acc_fkl += metrics.get("fkl_metric", 0.0) * metrics["tokens"]
         acc_tokens += metrics["tokens"]
         acc_count += 1
-        if accelerator.is_main_process and cfg.print_sample and metrics.get("sample_text"):
+        if accelerator.is_main_process and cfg.print_sample:
             if micro_step % cfg.print_every == 0:
-                accelerator.print(f"[sample] {metrics['sample_text']}")
+                full_text = metrics.get("sample_full", "")
+                prompt_text = metrics.get("sample_prompt", "")
+                cont_text = metrics.get("sample_cont", "")
+                if full_text:
+                    accelerator.print("[sample_full]")
+                    accelerator.print(full_text)
+                if prompt_text:
+                    accelerator.print("[sample_prompt]")
+                    accelerator.print(prompt_text)
+                if cont_text:
+                    accelerator.print("[sample_cont]")
+                    accelerator.print(cont_text)
 
         if accelerator.sync_gradients:
             update_step += 1
