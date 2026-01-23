@@ -295,7 +295,11 @@ def train_step(
     am_s_cpu = seq_std_cpu.ne(pad_id)
     cont_s = torch.zeros((B_s, max(T_s - 1, 0)), dtype=torch.bool)
     for i, L in enumerate(plen_s):
-        start = max(L - 1, 0)
+        nonpad = am_s_cpu[i].nonzero()
+        if len(nonpad) == 0:
+            continue
+        first_nonpad = int(nonpad[0].item())
+        start = max(first_nonpad + L - 1, 0)
         if T_s > 1:
             cont_s[i, start:] = True
     valid_s_cpu = cont_s & am_s_cpu[:, 1:]
@@ -305,8 +309,9 @@ def train_step(
         ids_0 = seq_std_cpu[0]
         nonpad = ids_0.ne(pad_id).nonzero()
         if len(nonpad) > 0:
+            first_nonpad = int(nonpad[0].item())
             end = int(nonpad[-1].item() + 1)
-            start = max(plen_s[0], 0)
+            start = max(first_nonpad + plen_s[0], 0)
             if end > start:
                 sample_text = tok.decode(ids_0[start:end].tolist())
     if tokens_s == 0:
@@ -578,11 +583,15 @@ def main(cfg: Config) -> None:
                         # per-position exact KL
                         r_pos = per_position_exact_kl(logp_s, logp_t, kind="rkl")
                         f_pos = per_position_exact_kl(logp_s, logp_t, kind="fkl")
-                        # valid mask: continuation and non-pad
-                        cont_mb = torch.zeros_like(r_pos, dtype=torch.bool)
-                        for j, L in enumerate(plens[sl]):
-                            start_j = max(L - 1, 0)
-                            cont_mb[j, start_j:] = True
+                    # valid mask: continuation and non-pad
+                    cont_mb = torch.zeros_like(r_pos, dtype=torch.bool)
+                    for j, L in enumerate(plens[sl]):
+                        nonpad = am_mb[j].nonzero()
+                        if len(nonpad) == 0:
+                            continue
+                        first_nonpad = int(nonpad[0].item())
+                        start_j = max(first_nonpad + L - 1, 0)
+                        cont_mb[j, start_j:] = True
                         valid_mb = cont_mb & am_mb[:, 1:].bool()
                         r_sum = r_sum + r_pos.masked_select(valid_mb).sum()
                         f_sum = f_sum + f_pos.masked_select(valid_mb).sum()
