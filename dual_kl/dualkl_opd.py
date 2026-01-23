@@ -59,6 +59,8 @@ class Config:
     grad_accum: int = 16
     eval_every: int = 20
     eval_exact_kl: bool = True
+    print_sample: bool = True
+    print_every: int = 1
     swanlab_project: str | None = None
     swanlab_name: str | None = None
     swanlab_mode: str = "online"
@@ -298,8 +300,23 @@ def train_step(
             cont_s[i, start:] = True
     valid_s_cpu = cont_s & am_s_cpu[:, 1:]
     tokens_s = int(valid_s_cpu.sum().item())
+    sample_text = ""
+    if B_s > 0:
+        ids_0 = seq_std_cpu[0]
+        nonpad = ids_0.ne(pad_id).nonzero()
+        if len(nonpad) > 0:
+            end = int(nonpad[-1].item() + 1)
+            start = max(plen_s[0], 0)
+            if end > start:
+                sample_text = tok.decode(ids_0[start:end].tolist())
     if tokens_s == 0:
-        return {"loss": 0.0, "lambda": 0.0, "rkl_metric": 0.0, "tokens": 0}
+        return {
+            "loss": 0.0,
+            "lambda": 0.0,
+            "rkl_metric": 0.0,
+            "tokens": 0,
+            "sample_text": sample_text,
+        }
 
     teacher.eval()
     student.train()
@@ -320,7 +337,7 @@ def train_step(
         valid_mb = (cont_s[sl].to(accelerator.device)) & attn_mb[:, 1:].bool()
         with accelerator.autocast():
             with torch.no_grad():
-                logits_t = teacher(input_ids=ids_mb, attention_mask=attn_mb, use_cache=True).logits
+                logits_t = teacher(input_ids=ids_mb, attention_mask=attn_mb, use_cache=False).logits
                 logp_t = nn.functional.log_softmax(logits_t, dim=-1)
                 del logits_t
             logits_s = student(input_ids=ids_mb, attention_mask=attn_mb, use_cache=False).logits
@@ -386,7 +403,14 @@ def train_step(
     lam_value = 1.0
     tokens = int(accelerator.gather_for_metrics(tokens_accum).sum().item())
     loss_val = accelerator.gather_for_metrics(loss_sum).mean().item()
-    return {"loss": float(loss_val), "lambda": float(lam_value), "rkl_metric": float(rkl_mean), "fkl_metric": float(fkl_mean), "tokens": tokens}
+    return {
+        "loss": float(loss_val),
+        "lambda": float(lam_value),
+        "rkl_metric": float(rkl_mean),
+        "fkl_metric": float(fkl_mean),
+        "tokens": tokens,
+        "sample_text": sample_text,
+    }
 
 
 def main(cfg: Config) -> None:
@@ -487,6 +511,9 @@ def main(cfg: Config) -> None:
         acc_fkl += metrics.get("fkl_metric", 0.0) * metrics["tokens"]
         acc_tokens += metrics["tokens"]
         acc_count += 1
+        if accelerator.is_main_process and cfg.print_sample and metrics.get("sample_text"):
+            if micro_step % cfg.print_every == 0:
+                accelerator.print(f"[sample] {metrics['sample_text']}")
 
         if accelerator.sync_gradients:
             update_step += 1
@@ -544,7 +571,7 @@ def main(cfg: Config) -> None:
                         am_mb = ids_mb.ne(pad_id).long()
                         with accelerator.autocast():
                             logits_s = student(input_ids=ids_mb, attention_mask=am_mb, use_cache=False).logits
-                            logits_t = teacher(input_ids=ids_mb, attention_mask=am_mb, use_cache=True).logits
+                            logits_t = teacher(input_ids=ids_mb, attention_mask=am_mb, use_cache=False).logits
                             logp_s = nn.functional.log_softmax(logits_s, dim=-1)
                             logp_t = nn.functional.log_softmax(logits_t, dim=-1)
                         # per-position exact KL
@@ -628,6 +655,8 @@ def parse_args() -> Config:
     p.add_argument("--grad_accum", type=int, default=1)
     p.add_argument("--eval_every", type=int, default=100)
     p.add_argument("--no_eval_exact_kl", action="store_true")
+    p.add_argument("--no_print_sample", action="store_true")
+    p.add_argument("--print_every", type=int, default=1)
     p.add_argument("--swanlab_project", type=str, default=None)
     p.add_argument("--swanlab_name", type=str, default=None)
     p.add_argument("--swanlab_mode", type=str, default="online", choices=["online", "offline", "disabled"])
@@ -673,6 +702,8 @@ def parse_args() -> Config:
         grad_accum=a.grad_accum,
         eval_every=a.eval_every,
         eval_exact_kl=not a.no_eval_exact_kl,
+        print_sample=not a.no_print_sample,
+        print_every=a.print_every,
         swanlab_project=a.swanlab_project,
         swanlab_name=a.swanlab_name,
         swanlab_mode=a.swanlab_mode,
