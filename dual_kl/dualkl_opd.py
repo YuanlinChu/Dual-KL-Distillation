@@ -501,7 +501,7 @@ def main(cfg: Config) -> None:
         with accelerator.accumulate(student):
             optimizer.zero_grad(set_to_none=True)
             metrics = train_step(student, teacher, tok, batch_prompts, cfg, accelerator, optimizer)
-            accelerator.clip_grad_norm_(student.parameters(), max_norm=1.0)
+            grad_norm = accelerator.clip_grad_norm_(student.parameters(), max_norm=1.0)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
         micro_step += 1
@@ -540,6 +540,7 @@ def main(cfg: Config) -> None:
                     "train/loss": mean_loss,
                     "train/reverse_kl": mean_rkl,
                     "train/forward_kl": mean_fkl,
+                    "train/grad_norm": float(grad_norm),
                     "train/tokens": acc_tokens,
                     "train/step": update_step,
                 }, step=update_step)
