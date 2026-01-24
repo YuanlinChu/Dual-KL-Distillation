@@ -293,16 +293,16 @@ def train_step(
     )
     # 2) 构造有效掩码（续写且非 pad）与 token 计数（基于学生序列；教师采样在同一上下文逐位进行）
     B_s, T_s = seq_std_cpu.size()
-    am_s_cpu = seq_std_cpu.ne(pad_id)
+    am_s_cpu = seq_std_cpu.ne(pad_id)                          # attention mask: 非pad位置为True
     cont_s = torch.zeros((B_s, max(T_s - 1, 0)), dtype=torch.bool)
     for i, L in enumerate(plen_s):
-        nonpad = am_s_cpu[i].nonzero()
+        nonpad = am_s_cpu[i].nonzero()          # [K, 1] 每一行是非padtoken的索引
         if len(nonpad) == 0:
             continue
-        first_nonpad = int(nonpad[0].item())
+        first_nonpad = int(nonpad[0].item())        # 第一个非padtoken的索引
         start = max(first_nonpad + L - 1, 0)
         if T_s > 1:
-            cont_s[i, start:] = True
+            cont_s[i, start:] = True                # 初始化续写掩码
     valid_s_cpu = cont_s & am_s_cpu[:, 1:]
     tokens_s = int(valid_s_cpu.sum().item())
     if cfg.debug_mask and accelerator.is_main_process and B_s > 0:
@@ -416,8 +416,8 @@ def train_step(
             rkl_loss_pos = rkl_loss_pos * pos_ratio
             fkl_loss_pos = fkl_loss_pos * pos_ratio
 
-        # Fixed weights: rKL=1.0; fKL default 1.0 (subject to optional decay above)
-        lam_R_mb = torch.tensor(1.0, device=accelerator.device)
+        # Fixed weights (subject to optional decay above)
+        lam_R_mb = torch.tensor(float(max(0.0, min(1.0, cfg.lam_r))), device=accelerator.device)
         lam_F_mb = torch.tensor(float(max(0.0, min(1.0, cfg.lam_f))), device=accelerator.device)
 
         # 汇总损失（按整批学生有效 token 数归一化），并反向
@@ -562,9 +562,9 @@ def main(cfg: Config) -> None:
                 full_text = metrics.get("sample_full", "")
                 prompt_text = metrics.get("sample_prompt", "")
                 cont_text = metrics.get("sample_cont", "")
-                if full_text:
-                    accelerator.print("[sample_full]")
-                    accelerator.print(full_text)
+                # if full_text:
+                #     accelerator.print("[sample_full]")
+                #     accelerator.print(full_text)
                 if prompt_text:
                     accelerator.print("[sample_prompt]")
                     accelerator.print(prompt_text)
