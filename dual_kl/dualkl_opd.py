@@ -37,15 +37,15 @@ class Config:
     student_model: str
     teacher_model: str
     output_dir: str
-    steps: int = 150
-    batch_size: int = 32
-    group_size: int = 4
-    max_tokens: int = 4096
+    steps: int = 125
+    batch_size: int = 256
+    group_size: int = 1
+    max_tokens: int = 2048
     temperature: float = 1
     top_p: float = 1.0
-    learning_rate: float = 1e-4
+    learning_rate: float = 1e-5
     weight_decay: float = 0.0
-    save_every: int = 20
+    save_every: int = 25
     prompts_file: str | None = None
     dataset: str | None = None
     dataset_field: str = "question"
@@ -56,8 +56,8 @@ class Config:
     lora_alpha: int = 32
     lora_dropout: float = 0.0
     dtype: str = "bf16"
-    grad_accum: int = 16
-    eval_every: int = 20
+    grad_accum: int = 1
+    eval_every: int = 25
     eval_exact_kl: bool = True
     print_sample: bool = True
     print_every: int = 1
@@ -69,8 +69,8 @@ class Config:
     teacher_ds_zero3: bool = False
     teacher_ds_config: str | None = None
     # Micro-batching
-    gen_micro_batch: int = 8
-    lp_micro_batch: int = 8
+    gen_micro_batch: int = 4
+    lp_micro_batch: int = 2
     # Progress
     progress: bool = True
     # Fixed weights (0..1); in this variant rKL is fixed to 1.0 during training
@@ -689,16 +689,16 @@ def parse_args() -> Config:
     p.add_argument("--student_model", type=str, required=True)
     p.add_argument("--teacher_model", type=str, required=True)
     p.add_argument("--output_dir", type=str, default="./dual-kl-out")
-    p.add_argument("--steps", type=int, default=1000)
-    p.add_argument("--batch_size", type=int, default=2)
+    p.add_argument("--steps", type=int, default=150)
+    p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--group_size", type=int, default=1)
-    p.add_argument("--max_tokens", type=int, default=128, help="生成总长度上限（含 prompt）")
-    p.add_argument("--temperature", type=float, default=0.8)
+    p.add_argument("--max_tokens", type=int, default=2048, help="生成总长度上限（含 prompt）")
+    p.add_argument("--temperature", type=float, default=1)
     p.add_argument("--top_p", type=float, default=1.0)
-    p.add_argument("--learning_rate", type=float, default=5e-5)
+    p.add_argument("--learning_rate", type=float, default=1e-5)
     p.add_argument("--weight_decay", type=float, default=0.0)
     # rKL/fKL 均为 MC 实现，无需额外开关
-    p.add_argument("--save_every", type=int, default=250)
+    p.add_argument("--save_every", type=int, default=25)
     p.add_argument("--prompts_file", type=str, default=None)
     p.add_argument("--dataset", type=str, default=None)
     p.add_argument(
@@ -715,7 +715,7 @@ def parse_args() -> Config:
     p.add_argument("--lora_dropout", type=float, default=0.0)
     p.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"])
     p.add_argument("--grad_accum", type=int, default=1)
-    p.add_argument("--eval_every", type=int, default=100)
+    p.add_argument("--eval_every", type=int, default=25)
     p.add_argument("--no_eval_exact_kl", action="store_true")
     p.add_argument("--no_print_sample", action="store_true")
     p.add_argument("--print_every", type=int, default=1)

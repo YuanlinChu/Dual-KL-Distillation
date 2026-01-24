@@ -2,6 +2,7 @@ tinker-cookbook/
 out/
 wandb/
 swanlab/
+test/
 data/DeepMath-32k/
 **/__pycache__/
 lora-vllm.md
