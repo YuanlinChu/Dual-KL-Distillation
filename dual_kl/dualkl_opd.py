@@ -674,14 +674,38 @@ def main(cfg: Config) -> None:
     if accelerator.is_main_process:
         if global_bar is not None:
             global_bar.close()
-        to_save = accelerator.unwrap_model(student)
-        to_save.save_pretrained(cfg.output_dir)
-        tok.save_pretrained(cfg.output_dir)
+
+        if update_step % cfg.save_every != 0:
+            ckpt_dir = os.path.join(cfg.output_dir, f"step-{update_step}")
+            os.makedirs(ckpt_dir, exist_ok=True)
+            to_save = accelerator.unwrap_model(student)
+            to_save.save_pretrained(ckpt_dir)
+            tok.save_pretrained(ckpt_dir)
+        
         accelerator.print(f"训练完成，模型已保存到 {cfg.output_dir}")
         if cfg.swanlab_project and SWANLAB_AVAILABLE:
             finish = getattr(swanlab, "finish", None)
             if callable(finish):
                 finish()
+    
+    # ===== 新增：显式清理分布式进程组 =====
+    accelerator.wait_for_everyone()  # 确保所有进程同步
+    accelerator.free_memory()  # 释放缓存的内存
+    
+    # 如果使用了 DeepSpeed，先清理 DeepSpeed
+    if cfg.teacher_ds_zero3 and DEEPSPEED_AVAILABLE:
+        if hasattr(teacher, 'destroy'):
+            teacher.destroy()
+    
+    # 清理分布式环境
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()  # 最后一次同步
+        torch.distributed.destroy_process_group()
+    
+    # 清理 CUDA 缓存
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
 
 def parse_args() -> Config:
