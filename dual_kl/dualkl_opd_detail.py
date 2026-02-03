@@ -789,8 +789,8 @@ def parse_args() -> Config:
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--warmup_steps", type=int, default=0, help="学习率 warmup 步数（>0 则优先使用）")
     p.add_argument("--warmup_ratio", type=float, default=0.03, help="学习率 warmup 比例（当 warmup_steps=0 时生效）")
-    p.add_argument("--lr_decay", type=str, default="cosine", choices=["cosine", "linear", "none"])
-    p.add_argument("--min_lr_ratio", type=float, default=0.1, help="decay 最小学习率比例（相对 base lr）")
+    p.add_argument("--lr_decay", type=str, default="linear", choices=["cosine", "linear", "none"])
+    p.add_argument("--min_lr_ratio", type=float, default=0.01, help="decay 最小学习率比例（相对 base lr）")
     # rKL/fKL 均为 MC 实现，无需额外开关
     p.add_argument("--save_every", type=int, default=25)
     p.add_argument("--prompts_file", type=str, default=None)
