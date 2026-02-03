@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import List, Tuple
 
 import torch
+import math
 from torch import nn
 from torch.optim import AdamW
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase, set_seed
@@ -45,6 +46,10 @@ class Config:
     top_p: float = 1.0
     learning_rate: float = 1e-5
     weight_decay: float = 0.0
+    warmup_steps: int = 0
+    warmup_ratio: float = 0.03
+    lr_decay: str = "cosine"
+    min_lr_ratio: float = 0.1
     save_every: int = 25
     prompts_file: str | None = None
     dataset: str | None = None
@@ -101,6 +106,34 @@ def init_swanlab(cfg: Config) -> None:
             except TypeError:
                 continue
     swanlab.init(**init_kwargs)
+
+def lr_multiplier(
+    step: int,
+    total_steps: int,
+    warmup_steps: int,
+    min_lr_ratio: float,
+    decay: str,
+) -> float:
+    if total_steps <= 0:
+        return 1.0
+    warmup_steps = max(0, min(warmup_steps, total_steps))
+    step = max(0, min(step, total_steps))
+    if warmup_steps > 0 and step <= warmup_steps:
+        return float(step) / float(max(1, warmup_steps))
+    if decay == "none" or total_steps <= warmup_steps:
+        return 1.0
+    progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+    progress = min(max(progress, 0.0), 1.0)
+    min_lr_ratio = min(max(min_lr_ratio, 0.0), 1.0)
+    if decay == "linear":
+        return max(min_lr_ratio, 1.0 - progress * (1.0 - min_lr_ratio))
+    if decay == "cosine":
+        return min_lr_ratio + 0.5 * (1.0 - min_lr_ratio) * (1.0 + math.cos(math.pi * progress))
+    return 1.0
+
+def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = lr
 
 
 def load_prompts(path: str | None) -> List[str]:
@@ -506,6 +539,9 @@ def main(cfg: Config) -> None:
         weight_decay=cfg.weight_decay,
     )
     student, optimizer = accelerator.prepare(student, optimizer)
+    total_steps = max(1, cfg.steps)
+    warmup_steps = cfg.warmup_steps if cfg.warmup_steps > 0 else int(cfg.warmup_ratio * total_steps)
+    warmup_steps = max(0, min(warmup_steps, total_steps))
 
     for p in teacher.parameters():
         p.requires_grad_(False)
@@ -556,6 +592,16 @@ def main(cfg: Config) -> None:
             batch_prompts = [truncate_by_tokens(tok, p, cfg.max_prompt_tokens) for p in batch_prompts]
 
         with accelerator.accumulate(student):
+            next_step = update_step + (1 if accelerator.sync_gradients else 0)
+            lr_mult = lr_multiplier(
+                next_step,
+                total_steps,
+                warmup_steps,
+                cfg.min_lr_ratio,
+                cfg.lr_decay,
+            )
+            current_lr = cfg.learning_rate * lr_mult
+            set_optimizer_lr(optimizer, current_lr)
             optimizer.zero_grad(set_to_none=True)
             metrics = train_step(student, teacher, tok, batch_prompts, cfg, accelerator, optimizer)
             grad_norm = accelerator.clip_grad_norm_(student.parameters(), max_norm=1.0)
@@ -603,7 +649,7 @@ def main(cfg: Config) -> None:
                 )
                 if global_bar is not None:
                     global_bar.set_postfix_str(
-                        f"loss={mean_loss:.4f} rkl={mean_rkl:.4f} fkl={mean_fkl:.4f} tok={acc_tokens}"
+                        f"loss={mean_loss:.4f} rkl={mean_rkl:.4f} fkl={mean_fkl:.4f} lr={current_lr:.2e} tok={acc_tokens}"
                     )
                 else:
                     accelerator.print(msg)
@@ -615,6 +661,7 @@ def main(cfg: Config) -> None:
                     "train/reverse_kl": mean_rkl,
                     "train/forward_kl": mean_fkl,
                     "train/grad_norm": float(grad_norm),
+                    "train/lr": float(current_lr),
                     "train/tokens": acc_tokens,
                     "train/step": update_step,
                 }, step=update_step)
@@ -740,6 +787,10 @@ def parse_args() -> Config:
     p.add_argument("--top_p", type=float, default=1.0)
     p.add_argument("--learning_rate", type=float, default=1e-5)
     p.add_argument("--weight_decay", type=float, default=0.0)
+    p.add_argument("--warmup_steps", type=int, default=0, help="学习率 warmup 步数（>0 则优先使用）")
+    p.add_argument("--warmup_ratio", type=float, default=0.03, help="学习率 warmup 比例（当 warmup_steps=0 时生效）")
+    p.add_argument("--lr_decay", type=str, default="cosine", choices=["cosine", "linear", "none"])
+    p.add_argument("--min_lr_ratio", type=float, default=0.1, help="decay 最小学习率比例（相对 base lr）")
     # rKL/fKL 均为 MC 实现，无需额外开关
     p.add_argument("--save_every", type=int, default=25)
     p.add_argument("--prompts_file", type=str, default=None)
@@ -794,6 +845,10 @@ def parse_args() -> Config:
         top_p=a.top_p,
         learning_rate=a.learning_rate,
         weight_decay=a.weight_decay,
+        warmup_steps=a.warmup_steps,
+        warmup_ratio=a.warmup_ratio,
+        lr_decay=a.lr_decay,
+        min_lr_ratio=a.min_lr_ratio,
         save_every=a.save_every,
         prompts_file=a.prompts_file,
         dataset=a.dataset,
