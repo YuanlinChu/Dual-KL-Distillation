@@ -85,6 +85,8 @@ class Config:
     fkl_pos_decay: bool = False
     # Chat formatting
     system_prompt: str | None = "Please reason step by step, and put your final answer within \\boxed{{}}."
+    # Resume training
+    resume_from_step: int = 0
 
 
 def ensure_pad_token(tok: PreTrainedTokenizerBase) -> None:
@@ -431,6 +433,7 @@ def train_step(
         probs_t = logp_t[:, :-1, :].exp()
         Bm, Lm, V = probs_t.shape
         sampled = torch.multinomial(probs_t.reshape(-1, V), num_samples=1).reshape(Bm, Lm)
+        del probs_t  # 立即释放
         t_g_t = logp_t[:, :-1, :].gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
         s_g_t = logp_s[:, :-1, :].gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
         # Advantage for fKL: only penalize when teacher prob > student prob
@@ -467,7 +470,7 @@ def train_step(
         d_fkl_sum = d_fkl_sum + d_fkl_mb.masked_select(valid_mb).sum()
         tokens_accum = tokens_accum + valid_mb.sum()
         loss_sum = loss_sum + loss_mb.detach()
-        del ids_mb, attn_mb, valid_mb, logp_t, logp_s, s_g_s, t_g_s, d_rkl_mb, rkl_loss_pos, probs_t, sampled, t_g_t, s_g_t, fkl_loss_pos, loss_mb
+        del ids_mb, attn_mb, valid_mb, logp_t, logp_s, s_g_s, t_g_s, d_rkl_mb, rkl_loss_pos, sampled, t_g_t, s_g_t, fkl_loss_pos, loss_mb
 
     # 跨进程聚合指标（lambda 取 lam_R，rkl_metric 取学生序列上的均值）
     rkl_mean = (
@@ -506,7 +509,19 @@ def main(cfg: Config) -> None:
         init_swanlab(cfg)
 
     torch_dtype = torch.bfloat16 if cfg.dtype.lower() == "bf16" else torch.float16 if cfg.dtype.lower() == "fp16" else None
-    student = AutoModelForCausalLM.from_pretrained(cfg.student_model, dtype=torch_dtype if torch_dtype else None)
+
+    # Resume: 如果指定了 resume_from_step，从对应 checkpoint 加载学生模型
+    student_model_path = cfg.student_model
+    if cfg.resume_from_step > 0:
+        ckpt_dir = os.path.join(cfg.output_dir, f"step-{cfg.resume_from_step}")
+        if os.path.exists(ckpt_dir):
+            student_model_path = ckpt_dir
+            if accelerator.is_main_process:
+                print(f"[Resume] 从 {ckpt_dir} 加载学生模型，跳过前 {cfg.resume_from_step} 步")
+        else:
+            raise FileNotFoundError(f"Resume checkpoint not found: {ckpt_dir}")
+
+    student = AutoModelForCausalLM.from_pretrained(student_model_path, dtype=torch_dtype if torch_dtype else None)
     teacher = AutoModelForCausalLM.from_pretrained(cfg.teacher_model, dtype=torch_dtype if torch_dtype else None)
     tok = AutoTokenizer.from_pretrained(cfg.student_model)
     ensure_pad_token(tok)
@@ -558,10 +573,18 @@ def main(cfg: Config) -> None:
     prompts = get_prompts(cfg)
     micro_step = 0
     update_step = 0
+
+    # Resume: 跳过已完成的步数和对应的 micro_step
+    if cfg.resume_from_step > 0:
+        update_step = cfg.resume_from_step
+        micro_step = cfg.resume_from_step * cfg.grad_accum
+        if accelerator.is_main_process:
+            print(f"[Resume] 从 update_step={update_step}, micro_step={micro_step} 继续训练")
+
     # 全局训练进度条（显示 step/total）
     global_bar = None
     if cfg.progress and _HAVE_TQDM and accelerator.is_main_process:
-        global_bar = tqdm(total=cfg.steps, desc="train", dynamic_ncols=True)
+        global_bar = tqdm(total=cfg.steps, initial=update_step, desc="train", dynamic_ncols=True)
     acc_loss = 0.0
     acc_rkl = 0.0
     acc_fkl = 0.0
@@ -813,6 +836,7 @@ def parse_args() -> Config:
         default="Please reason step by step, and put your final answer within \\boxed{{}}.",
         help="可选的系统提示（作为 system role 或文本前缀）",
     )
+    p.add_argument("--resume_from_step", type=int, default=0, help="从指定 step 的 checkpoint 恢复训练")
     a = p.parse_args()
     return Config(
         student_model=a.student_model,
@@ -859,6 +883,7 @@ def parse_args() -> Config:
         lam_f=max(0.0, min(1.0, a.lam_f)),
         fkl_pos_decay=bool(a.fkl_pos_decay),
         system_prompt=a.system_prompt,
+        resume_from_step=a.resume_from_step,
     )
 
 

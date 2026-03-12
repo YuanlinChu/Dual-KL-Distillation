@@ -48,7 +48,7 @@ class Config:
     weight_decay: float = 0.0
     warmup_steps: int = 0
     warmup_ratio: float = 0.03
-    lr_decay: str = "cosine"
+    lr_decay: str = "linear"
     min_lr_ratio: float = 0.1
     save_every: int = 25
     prompts_file: str | None = None
