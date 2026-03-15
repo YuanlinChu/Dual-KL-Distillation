@@ -161,7 +161,7 @@ def load_deepmath_prompts() -> List[str] | None:
 def get_prompts(cfg: Config) -> List[str]:
     if cfg.prompts_file:
         return load_prompts(cfg.prompts_file)
-    # 支持从本地 HF 数据集目录加载（datasets.save_to_disk 输出）
+    # 方式1: 尝试 load_from_disk（Arrow 格式，save_to_disk 输出）
     if cfg.dataset and os.path.exists(cfg.dataset):
         try:
             from datasets import load_from_disk  # type: ignore
@@ -181,6 +181,25 @@ def get_prompts(cfg: Config) -> List[str]:
                     return [str(v) for v in ds[alt]]  # type: ignore
         except Exception:
             pass
+        # 方式2: 直接读取 parquet 文件（兼容 HF repo 格式 data/*.parquet）
+        try:
+            import glob
+            import pandas as pd
+
+            parquet_files = sorted(glob.glob(os.path.join(cfg.dataset, "data", "*.parquet")))
+            if not parquet_files:
+                parquet_files = sorted(glob.glob(os.path.join(cfg.dataset, "*.parquet")))
+            if parquet_files:
+                df = pd.concat([pd.read_parquet(f) for f in parquet_files], ignore_index=True)
+                col = cfg.dataset_field or "question"
+                if col in df.columns:
+                    return df[col].dropna().astype(str).tolist()
+                for alt in ["question", "prompt", "input", "text"]:
+                    if alt in df.columns:
+                        return df[alt].dropna().astype(str).tolist()
+        except Exception:
+            pass
+
     if cfg.dataset == "deepmath":
         p = load_deepmath_prompts()
         if p:

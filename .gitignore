@@ -4,6 +4,7 @@ wandb/
 swanlab/
 test/
 data/DeepMath-32k/
+data/DeepMath-103K/
 **/__pycache__/
 lora-vllm.md
 evalscope-test/outputs*/
