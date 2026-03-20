@@ -2,7 +2,6 @@ tinker-cookbook/
 out/
 wandb/
 swanlab/
-test/
 data/DeepMath-32k/
 data/DeepMath-103K/
 **/__pycache__/

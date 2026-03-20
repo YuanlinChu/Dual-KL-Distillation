@@ -33,11 +33,21 @@ accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
 
 accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
   -m dual_kl.dualkl_opd \
-  --student_model /data/oss_bucket_0/zhulin/output/Qwen3-4B-Base-sft-checkpoint-803 --teacher_model /data/oss_bucket_0/zhulin/models/Qwen3-8B \
-  --dataset /home/wangyadao.wyd/project/Dual-KL-Distillation/data/DeepMath-103K --batch_size 256 --group_size 1 --grad_accum 1 \
-  --max_tokens 2048 --steps 402 --gen_micro_batch 4 --lp_micro_batch 2 \
+  --student_model /data/oss_bucket_0/zhulin/output/Qwen3-4B-Base-sft-checkpoint-201 --teacher_model /data/oss_bucket_0/zhulin/models/Qwen3-8B \
+  --dataset /data/oss_bucket_0/zhulin/datasets/DeepMath-103K --batch_size 256 --group_size 1 --grad_accum 1 \
+  --max_tokens 2048 --steps 402 --gen_micro_batch 32 --lp_micro_batch 2 \
   --swanlab_project dualkl-distill --swanlab_name dkl-4b_base_sft_803-8b-r1f1-103k \
   --teacher_ds_zero3 --output_dir /data/oss_bucket_0/zhulin/output/opd-out/dkl-4b_base_sft_803-8b-r1f1-103k \
+  --lam_r 1 --lam_f 1 --learning_rate 5e-6
+
+
+accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
+  -m dual_kl.dualkl_opd \
+  --student_model /home/chuyuanlin.cyl/.cache/modelscope/hub/models/Qwen/Qwen3-0.6B-Base --teacher_model /data/oss_bucket_0/zhulin/output/Qwen3-4B-Base-sft-checkpoint-201 \
+  --dataset /data/oss_bucket_0/zhulin/datasets/DeepMath-103K --batch_size 256 --group_size 1 --grad_accum 1 \
+  --max_tokens 2048 --steps 402 --gen_micro_batch 4 --lp_micro_batch 2 \
+  --swanlab_project dualkl-distill --swanlab_name test \
+  --teacher_ds_zero3 --output_dir /data/oss_bucket_0/zhulin/output/opd-out/test \
   --lam_r 1 --lam_f 1 --learning_rate 5e-6
 
 

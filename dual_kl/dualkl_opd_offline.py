@@ -1,3 +1,5 @@
+# 离线训练版本，主要是适配了低版本torch，已经offline的swanlab
+
 from __future__ import annotations
 
 import argparse
@@ -6,6 +8,7 @@ from dataclasses import dataclass
 from typing import List, Tuple
 
 import torch
+import math
 from torch import nn
 from torch.optim import AdamW
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase, set_seed
@@ -37,15 +40,19 @@ class Config:
     student_model: str
     teacher_model: str
     output_dir: str
-    steps: int = 1000
-    batch_size: int = 2
+    steps: int = 125
+    batch_size: int = 256
     group_size: int = 1
-    max_new_tokens: int = 128
-    temperature: float = 0.8
-    top_p: float = 0.95
-    learning_rate: float = 5e-5
+    max_tokens: int = 2048
+    temperature: float = 1
+    top_p: float = 1.0
+    learning_rate: float = 1e-5
     weight_decay: float = 0.0
-    save_every: int = 100
+    warmup_steps: int = 0
+    warmup_ratio: float = 0.03
+    lr_decay: str = "linear"
+    min_lr_ratio: float = 0.1
+    save_every: int = 25
     prompts_file: str | None = None
     dataset: str | None = None
     dataset_field: str = "question"
@@ -53,20 +60,24 @@ class Config:
     seed: int = 42
     use_lora: bool = False
     lora_r: int = 32
-    lora_alpha: int = 16
-    lora_dropout: float = 0.05
+    lora_alpha: int = 32
+    lora_dropout: float = 0.0
     dtype: str = "bf16"
     grad_accum: int = 1
-    eval_every: int = 100
+    eval_every: int = 25
+    eval_exact_kl: bool = True
+    print_sample: bool = True
+    print_every: int = 1
+    debug_mask: bool = False
     swanlab_project: str | None = None
     swanlab_name: str | None = None
-    swanlab_mode: str = "online"
+    swanlab_mode: str = "offline"
     # Teacher sharding
     teacher_ds_zero3: bool = False
     teacher_ds_config: str | None = None
     # Micro-batching
-    gen_micro_batch: int = 8
-    lp_micro_batch: int = 8
+    gen_micro_batch: int = 4
+    lp_micro_batch: int = 2
     # Progress
     progress: bool = True
     # Fixed weights (0..1); in this variant rKL is fixed to 1.0 during training
@@ -75,8 +86,9 @@ class Config:
     # Enable position-decayed fKL weight: pos_ratio = 1 - pos_in_seq / seq_len
     fkl_pos_decay: bool = False
     # Chat formatting
-    use_chat_template: bool = False
     system_prompt: str | None = "Please reason step by step, and put your final answer within \\boxed{{}}."
+    # Resume training
+    resume_from_step: int = 0
 
 
 def ensure_pad_token(tok: PreTrainedTokenizerBase) -> None:
@@ -89,7 +101,12 @@ def device_of(model: PreTrainedModel) -> torch.device:
 
 
 def init_swanlab(cfg: Config) -> None:
-    init_kwargs = {"project": cfg.swanlab_project, "config": vars(cfg)}
+    init_kwargs = {
+        "project": cfg.swanlab_project,
+        "config": vars(cfg),
+        "mode": cfg.swanlab_mode,  # 显式传入 mode
+        "logdir": cfg.output_dir,   # 可选：指定日志保存目录
+    }
     if cfg.swanlab_name:
         for name_key in ("experiment_name", "name", "run_name"):
             try:
@@ -99,15 +116,40 @@ def init_swanlab(cfg: Config) -> None:
                 continue
     swanlab.init(**init_kwargs)
 
+def lr_multiplier(
+    step: int,
+    total_steps: int,
+    warmup_steps: int,
+    min_lr_ratio: float,
+    decay: str,
+) -> float:
+    if total_steps <= 0:
+        return 1.0
+    warmup_steps = max(0, min(warmup_steps, total_steps))
+    step = max(0, min(step, total_steps))
+    if warmup_steps > 0 and step <= warmup_steps:
+        return float(step) / float(max(1, warmup_steps))
+    if decay == "none" or total_steps <= warmup_steps:
+        return 1.0
+    progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+    progress = min(max(progress, 0.0), 1.0)
+    min_lr_ratio = min(max(min_lr_ratio, 0.0), 1.0)
+    if decay == "linear":
+        return max(min_lr_ratio, 1.0 - progress * (1.0 - min_lr_ratio))
+    if decay == "cosine":
+        return min_lr_ratio + 0.5 * (1.0 - min_lr_ratio) * (1.0 + math.cos(math.pi * progress))
+    return 1.0
+
+def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+
 
 def load_prompts(path: str | None) -> List[str]:
-    if path is None or not os.path.exists(path):
-        return [
-            "解释熵的直观含义。",
-            "写一首四句的小诗，主题是海。",
-            "单元测试的优缺点有哪些？",
-            "简要对比 HTTP/1.1 与 HTTP/2 的差别。",
-        ]
+    if path is None:
+        raise ValueError("prompts file path must be provided")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"prompts file not found: {path}")
     with open(path, "r", encoding="utf-8") as f:
         return [line.strip() for line in f if line.strip()]
 
@@ -126,7 +168,7 @@ def load_deepmath_prompts() -> List[str] | None:
 def get_prompts(cfg: Config) -> List[str]:
     if cfg.prompts_file:
         return load_prompts(cfg.prompts_file)
-    # 支持从本地 HF 数据集目录加载（datasets.save_to_disk 输出）
+    # 方式1: 尝试 load_from_disk（Arrow 格式，save_to_disk 输出）
     if cfg.dataset and os.path.exists(cfg.dataset):
         try:
             from datasets import load_from_disk  # type: ignore
@@ -146,6 +188,25 @@ def get_prompts(cfg: Config) -> List[str]:
                     return [str(v) for v in ds[alt]]  # type: ignore
         except Exception:
             pass
+        # 方式2: 直接读取 parquet 文件（兼容 HF repo 格式 data/*.parquet）
+        try:
+            import glob
+            import pandas as pd
+
+            parquet_files = sorted(glob.glob(os.path.join(cfg.dataset, "data", "*.parquet")))
+            if not parquet_files:
+                parquet_files = sorted(glob.glob(os.path.join(cfg.dataset, "*.parquet")))
+            if parquet_files:
+                df = pd.concat([pd.read_parquet(f) for f in parquet_files], ignore_index=True)
+                col = cfg.dataset_field or "question"
+                if col in df.columns:
+                    return df[col].dropna().astype(str).tolist()
+                for alt in ["question", "prompt", "input", "text"]:
+                    if alt in df.columns:
+                        return df[alt].dropna().astype(str).tolist()
+        except Exception:
+            pass
+
     if cfg.dataset == "deepmath":
         p = load_deepmath_prompts()
         if p:
@@ -179,38 +240,21 @@ def truncate_by_tokens(tok: PreTrainedTokenizerBase, text: str, max_tokens: int)
 def apply_chat_format(
     tok: PreTrainedTokenizerBase,
     questions: List[str],
-    use_chat_template: bool,
     system_prompt: str | None,
 ) -> List[str]:
-    """Return prompts formatted as chat messages if requested.
+    """Return prompts formatted using the tokenizer chat template.
 
-    Prefer tokenizer.apply_chat_template when available; otherwise fall back
-    to a simple textual prefix that mimics chat structure.
+    Requires tokenizer.apply_chat_template (Qwen3 chat template).
     """
-    if not use_chat_template:
-        # No formatting requested; optionally prepend a light system prefix
-        if system_prompt:
-            return [f"{system_prompt}\n\nUser: {q}\nAssistant:" for q in questions]
-        return questions
-
+    if not (hasattr(tok, "apply_chat_template") and callable(getattr(tok, "apply_chat_template"))):
+        raise RuntimeError("Tokenizer does not support apply_chat_template; Qwen3 chat template is required.")
     out: List[str] = []
-    has_template = hasattr(tok, "apply_chat_template") and callable(getattr(tok, "apply_chat_template"))
     for q in questions:
-        if has_template:
-            msgs = []
-            if system_prompt:
-                msgs.append({"role": "system", "content": system_prompt})
-            msgs.append({"role": "user", "content": q})
-            try:
-                txt = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-            except Exception:
-                # Fallback to simple textual template
-                pref = (system_prompt + "\n\n") if system_prompt else ""
-                txt = f"{pref}User: {q}\nAssistant:"
-        else:
-            pref = (system_prompt + "\n\n") if system_prompt else ""
-            txt = f"{pref}User: {q}\nAssistant:"
-        out.append(txt)
+        msgs = []
+        if system_prompt:
+            msgs.append({"role": "system", "content": system_prompt})
+        msgs.append({"role": "user", "content": q})
+        out.append(tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True))
     return out
 
 def per_position_exact_kl(logp_s: torch.Tensor, logp_t: torch.Tensor, kind: str) -> torch.Tensor:
@@ -235,13 +279,13 @@ def generate_continuations(
     model: PreTrainedModel,
     tok: PreTrainedTokenizerBase,
     prompts: List[str],
-    max_new_tokens: int,
+    max_tokens: int,
     temperature: float,
     top_p: float,
     micro_batch: int,
     show_progress: bool,
 ) -> Tuple[torch.Tensor, List[int], int]:
-    """Generate in micro-batches; return CPU tensor to lower GPU peak.
+    """Generate in micro-batches with total-length cap; return CPU tensor to lower GPU peak.
 
     Returns:
         seq_std_cpu: torch.LongTensor [B, T] on CPU (right-padded to global max_T)
@@ -261,10 +305,14 @@ def generate_continuations(
             chunk = prompts[i : i + max(1, micro_batch)]
             batch = tok(chunk, return_tensors="pt", padding=True, truncation=True)
             batch = {k: v.to(device_of(model_for_gen)) for k, v in batch.items()}
+
+            prompt_len = batch["input_ids"].size(1)
+            max_new = max(max_tokens - prompt_len, 128)
+
             gen = model_for_gen.generate(
                 **batch,
                 do_sample=True,
-                max_new_tokens=max_new_tokens,
+                max_new_tokens=max_new,
                 temperature=temperature,
                 top_p=top_p,
                 pad_token_id=pad_id,
@@ -300,22 +348,80 @@ def train_step(
     # 1) 学生 on-policy 生成（微批），结果存 CPU
     seq_std_cpu, plen_s, pad_id = generate_continuations(
         student, tok, prompts,
-        cfg.max_new_tokens, cfg.temperature, cfg.top_p,
+        cfg.max_tokens, cfg.temperature, cfg.top_p,
         cfg.gen_micro_batch,
         cfg.progress and accelerator.is_main_process,
     )
     # 2) 构造有效掩码（续写且非 pad）与 token 计数（基于学生序列；教师采样在同一上下文逐位进行）
     B_s, T_s = seq_std_cpu.size()
-    am_s_cpu = seq_std_cpu.ne(pad_id)
+    am_s_cpu = seq_std_cpu.ne(pad_id)                          # attention mask: 非pad位置为True
     cont_s = torch.zeros((B_s, max(T_s - 1, 0)), dtype=torch.bool)
     for i, L in enumerate(plen_s):
-        start = max(L - 1, 0)
+        nonpad = am_s_cpu[i].nonzero()          # [K, 1] 每一行是非padtoken的索引
+        if len(nonpad) == 0:
+            continue
+        first_nonpad = int(nonpad[0].item())        # 第一个非padtoken的索引
+        start = max(first_nonpad + L - 1, 0)
         if T_s > 1:
-            cont_s[i, start:] = True
+            cont_s[i, start:] = True                # 初始化续写掩码
     valid_s_cpu = cont_s & am_s_cpu[:, 1:]
     tokens_s = int(valid_s_cpu.sum().item())
+    if cfg.debug_mask and accelerator.is_main_process and B_s > 0:
+        prompt0 = prompts[0]
+        prompt_ids = tok(prompt0, return_tensors="pt", truncation=True)["input_ids"][0].cpu()
+        prompt_len = int(prompt_ids.numel())
+        nonpad = am_s_cpu[0].nonzero()
+        if len(nonpad) == 0:
+            raise RuntimeError("debug_mask: sample has no non-pad tokens")
+        first_nonpad = int(nonpad[0].item())
+        seq_len = int(seq_std_cpu.size(1))
+        if first_nonpad + prompt_len > seq_len:
+            raise RuntimeError(
+                f"debug_mask: prompt slice out of range: first_nonpad={first_nonpad}, "
+                f"prompt_len={prompt_len}, seq_len={seq_len}"
+            )
+        seq_prompt = seq_std_cpu[0, first_nonpad : first_nonpad + prompt_len]
+        if not torch.equal(seq_prompt.cpu(), prompt_ids):
+            raise RuntimeError(
+                "debug_mask: prompt ids do not match sequence slice. "
+                f"first_nonpad={first_nonpad}, prompt_len={prompt_len}"
+            )
+        cont_idx = cont_s[0].nonzero()
+        if len(cont_idx) == 0:
+            raise RuntimeError("debug_mask: continuation mask has no True values")
+        first_true = int(cont_idx[0].item())
+        expected_start = max(first_nonpad + prompt_len - 1, 0)
+        if first_true != expected_start:
+            raise RuntimeError(
+                "debug_mask: continuation start mismatch. "
+                f"first_true={first_true}, expected_start={expected_start}"
+            )
+    sample_full = ""
+    sample_prompt = ""
+    sample_cont = ""
+    if B_s > 0:
+        ids_0 = seq_std_cpu[0]
+        nonpad = ids_0.ne(pad_id).nonzero()
+        if len(nonpad) > 0:
+            first_nonpad = int(nonpad[0].item())
+            end = int(nonpad[-1].item() + 1)
+            prompt_start = first_nonpad
+            prompt_end = max(first_nonpad + plen_s[0], prompt_start)
+            sample_full = tok.decode(ids_0[prompt_start:end].tolist())
+            if prompt_end > prompt_start:
+                sample_prompt = tok.decode(ids_0[prompt_start:prompt_end].tolist())
+            if end > prompt_end:
+                sample_cont = tok.decode(ids_0[prompt_end:end].tolist())
     if tokens_s == 0:
-        return {"loss": 0.0, "lambda": 0.0, "rkl_metric": 0.0, "tokens": 0}
+        return {
+            "loss": 0.0,
+            "lambda": 0.0,
+            "rkl_metric": 0.0,
+            "tokens": 0,
+            "sample_full": sample_full,
+            "sample_prompt": sample_prompt,
+            "sample_cont": sample_cont,
+        }
 
     teacher.eval()
     student.train()
@@ -336,7 +442,7 @@ def train_step(
         valid_mb = (cont_s[sl].to(accelerator.device)) & attn_mb[:, 1:].bool()
         with accelerator.autocast():
             with torch.no_grad():
-                logits_t = teacher(input_ids=ids_mb, attention_mask=attn_mb, use_cache=True).logits
+                logits_t = teacher(input_ids=ids_mb, attention_mask=attn_mb, use_cache=False).logits
                 logp_t = nn.functional.log_softmax(logits_t, dim=-1)
                 del logits_t
             logits_s = student(input_ids=ids_mb, attention_mask=attn_mb, use_cache=False).logits
@@ -346,18 +452,20 @@ def train_step(
         s_g_s = logp_s[:, :-1, :].gather(-1, ids_mb[:, 1:].unsqueeze(-1)).squeeze(-1)
         t_g_s = logp_t[:, :-1, :].gather(-1, ids_mb[:, 1:].unsqueeze(-1)).squeeze(-1)
         d_rkl_mb = (s_g_s - t_g_s).detach()
+        # Policy-gradient form with KL advantage: A = -(logp_s - logp_t)
         rkl_loss_pos = d_rkl_mb * s_g_s
 
         # fKL-MC：逐位从教师分布采样 token（同一上下文）
         probs_t = logp_t[:, :-1, :].exp()
         Bm, Lm, V = probs_t.shape
         sampled = torch.multinomial(probs_t.reshape(-1, V), num_samples=1).reshape(Bm, Lm)
+        del probs_t  # 立即释放
         t_g_t = logp_t[:, :-1, :].gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
         s_g_t = logp_s[:, :-1, :].gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
         # Advantage for fKL: only penalize when teacher prob > student prob
         d_fkl_mb = (t_g_t - s_g_t).detach()
         fkl_loss_pos = - s_g_t
-        # Position-decayed weight for fKL (optional)
+        # Position-decayed weight for fKL/rKL (optional)
         if cfg.fkl_pos_decay:
             # pos_in_seq counts from the first generated token (after prompt)
             # start positions per sample (prompt length - 1)
@@ -367,10 +475,11 @@ def train_step(
             seq_len = torch.clamp(Lm - starts, min=1)
             pos_ratio = 1.0 - (pos_idx.float() / seq_len.unsqueeze(1).float())
             pos_ratio = torch.clamp(pos_ratio, 0.0, 1.0)
+            rkl_loss_pos = rkl_loss_pos * pos_ratio
             fkl_loss_pos = fkl_loss_pos * pos_ratio
 
-        # Fixed weights: rKL=1.0; fKL default 1.0 (subject to optional decay above)
-        lam_R_mb = torch.tensor(1.0, device=accelerator.device)
+        # Fixed weights (subject to optional decay above)
+        lam_R_mb = torch.tensor(float(max(0.0, min(1.0, cfg.lam_r))), device=accelerator.device)
         lam_F_mb = torch.tensor(float(max(0.0, min(1.0, cfg.lam_f))), device=accelerator.device)
 
         # 汇总损失（按整批学生有效 token 数归一化），并反向
@@ -387,7 +496,7 @@ def train_step(
         d_fkl_sum = d_fkl_sum + d_fkl_mb.masked_select(valid_mb).sum()
         tokens_accum = tokens_accum + valid_mb.sum()
         loss_sum = loss_sum + loss_mb.detach()
-        del ids_mb, attn_mb, valid_mb, logp_t, logp_s, s_g_s, t_g_s, d_rkl_mb, rkl_loss_pos, probs_t, sampled, t_g_t, s_g_t, fkl_loss_pos, loss_mb
+        del ids_mb, attn_mb, valid_mb, logp_t, logp_s, s_g_s, t_g_s, d_rkl_mb, rkl_loss_pos, sampled, t_g_t, s_g_t, fkl_loss_pos, loss_mb
 
     # 跨进程聚合指标（lambda 取 lam_R，rkl_metric 取学生序列上的均值）
     rkl_mean = (
@@ -400,7 +509,16 @@ def train_step(
     lam_value = 1.0
     tokens = int(accelerator.gather_for_metrics(tokens_accum).sum().item())
     loss_val = accelerator.gather_for_metrics(loss_sum).mean().item()
-    return {"loss": float(loss_val), "lambda": float(lam_value), "rkl_metric": float(rkl_mean), "fkl_metric": float(fkl_mean), "tokens": tokens}
+    return {
+        "loss": float(loss_val),
+        "lambda": float(lam_value),
+        "rkl_metric": float(rkl_mean),
+        "fkl_metric": float(fkl_mean),
+        "tokens": tokens,
+        "sample_full": sample_full,
+        "sample_prompt": sample_prompt,
+        "sample_cont": sample_cont,
+    }
 
 
 def main(cfg: Config) -> None:
@@ -417,8 +535,20 @@ def main(cfg: Config) -> None:
         init_swanlab(cfg)
 
     torch_dtype = torch.bfloat16 if cfg.dtype.lower() == "bf16" else torch.float16 if cfg.dtype.lower() == "fp16" else None
-    student = AutoModelForCausalLM.from_pretrained(cfg.student_model, dtype=torch_dtype if torch_dtype else None)
-    teacher = AutoModelForCausalLM.from_pretrained(cfg.teacher_model, dtype=torch_dtype if torch_dtype else None)
+
+    # Resume: 如果指定了 resume_from_step，从对应 checkpoint 加载学生模型
+    student_model_path = cfg.student_model
+    if cfg.resume_from_step > 0:
+        ckpt_dir = os.path.join(cfg.output_dir, f"step-{cfg.resume_from_step}")
+        if os.path.exists(ckpt_dir):
+            student_model_path = ckpt_dir
+            if accelerator.is_main_process:
+                print(f"[Resume] 从 {ckpt_dir} 加载学生模型，跳过前 {cfg.resume_from_step} 步")
+        else:
+            raise FileNotFoundError(f"Resume checkpoint not found: {ckpt_dir}")
+
+    student = AutoModelForCausalLM.from_pretrained(student_model_path, torch_dtype=torch_dtype if torch_dtype else None)
+    teacher = AutoModelForCausalLM.from_pretrained(cfg.teacher_model, torch_dtype=torch_dtype if torch_dtype else None)
     tok = AutoTokenizer.from_pretrained(cfg.student_model)
     ensure_pad_token(tok)
     try:
@@ -433,8 +563,17 @@ def main(cfg: Config) -> None:
         lora_cfg = LoraConfig(r=cfg.lora_r, lora_alpha=cfg.lora_alpha, lora_dropout=cfg.lora_dropout, bias="none", task_type="CAUSAL_LM", target_modules=target_modules)
         student = get_peft_model(student, lora_cfg)
 
-    optimizer = AdamW(student.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+    optimizer = AdamW(
+        student.parameters(),
+        lr=cfg.learning_rate,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+        weight_decay=cfg.weight_decay,
+    )
     student, optimizer = accelerator.prepare(student, optimizer)
+    total_steps = max(1, cfg.steps)
+    warmup_steps = cfg.warmup_steps if cfg.warmup_steps > 0 else int(cfg.warmup_ratio * total_steps)
+    warmup_steps = max(0, min(warmup_steps, total_steps))
 
     for p in teacher.parameters():
         p.requires_grad_(False)
@@ -458,13 +597,27 @@ def main(cfg: Config) -> None:
         teacher, _, _, _ = deepspeed.initialize(model=teacher, model_parameters=None, config=ds_cfg)
 
     prompts = get_prompts(cfg)
-    step = 0
+    micro_step = 0
+    update_step = 0
+
+    # Resume: 跳过已完成的步数和对应的 micro_step
+    if cfg.resume_from_step > 0:
+        update_step = cfg.resume_from_step
+        micro_step = cfg.resume_from_step * cfg.grad_accum
+        if accelerator.is_main_process:
+            print(f"[Resume] 从 update_step={update_step}, micro_step={micro_step} 继续训练")
+
     # 全局训练进度条（显示 step/total）
     global_bar = None
     if cfg.progress and _HAVE_TQDM and accelerator.is_main_process:
-        global_bar = tqdm(total=cfg.steps, desc="train", dynamic_ncols=True)
-    while step < cfg.steps:
-        start = (step * cfg.batch_size) % max(1, len(prompts))
+        global_bar = tqdm(total=cfg.steps, initial=update_step, desc="train", dynamic_ncols=True)
+    acc_loss = 0.0
+    acc_rkl = 0.0
+    acc_fkl = 0.0
+    acc_tokens = 0
+    acc_count = 0
+    while update_step < cfg.steps:
+        start = (micro_step * cfg.batch_size) % max(1, len(prompts))
         end = start + cfg.batch_size
         groups = prompts[start:end] if end <= len(prompts) else (prompts[start:] + prompts[: (end % len(prompts))])
         world = accelerator.num_processes
@@ -472,111 +625,186 @@ def main(cfg: Config) -> None:
         groups_shard = [g for i, g in enumerate(groups) if i % max(1, world) == rank]
         batch_prompts = [p for p in groups_shard for _ in range(cfg.group_size)]
         # Apply chat/system formatting if requested
-        batch_prompts = apply_chat_format(tok, batch_prompts, cfg.use_chat_template, cfg.system_prompt)
+        batch_prompts = apply_chat_format(tok, batch_prompts, cfg.system_prompt)
         if cfg.max_prompt_tokens is not None:
             batch_prompts = [truncate_by_tokens(tok, p, cfg.max_prompt_tokens) for p in batch_prompts]
 
         with accelerator.accumulate(student):
+            next_step = update_step + (1 if accelerator.sync_gradients else 0)
+            lr_mult = lr_multiplier(
+                next_step,
+                total_steps,
+                warmup_steps,
+                cfg.min_lr_ratio,
+                cfg.lr_decay,
+            )
+            current_lr = cfg.learning_rate * lr_mult
+            set_optimizer_lr(optimizer, current_lr)
             optimizer.zero_grad(set_to_none=True)
             metrics = train_step(student, teacher, tok, batch_prompts, cfg, accelerator, optimizer)
-            accelerator.clip_grad_norm_(student.parameters(), max_norm=1.0)
+            grad_norm = accelerator.clip_grad_norm_(student.parameters(), max_norm=1.0)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
-        step += 1
-        if global_bar is not None:
-            global_bar.update(1)
+        micro_step += 1
 
-        if accelerator.is_main_process and (step % 10 == 0 or step == 1):
-            msg = (
-                f"step {step:05d}/{cfg.steps:05d} | "
-                f"loss={metrics['loss']:.4f} rkl={metrics['rkl_metric']:.4f} d_fkl={metrics.get('fkl_metric', 0.0):.4f} tokens={metrics['tokens']}"
-            )
+        acc_loss += metrics["loss"]
+        acc_rkl += metrics["rkl_metric"] * metrics["tokens"]
+        acc_fkl += metrics.get("fkl_metric", 0.0) * metrics["tokens"]
+        acc_tokens += metrics["tokens"]
+        acc_count += 1
+        if accelerator.is_main_process and cfg.print_sample:
+            if micro_step % cfg.print_every == 0:
+                full_text = metrics.get("sample_full", "")
+                prompt_text = metrics.get("sample_prompt", "")
+                cont_text = metrics.get("sample_cont", "")
+                # if full_text:
+                #     accelerator.print("[sample_full]")
+                #     accelerator.print(full_text)
+                if prompt_text:
+                    accelerator.print("[sample_prompt]")
+                    accelerator.print(prompt_text)
+                if cont_text:
+                    accelerator.print("[sample_cont]")
+                    accelerator.print(cont_text)
+
+        if accelerator.sync_gradients:
+            update_step += 1
             if global_bar is not None:
-                global_bar.set_postfix_str(
-                    f"loss={metrics['loss']:.4f} rkl={metrics['rkl_metric']:.4f} fkl={metrics.get('fkl_metric', 0.0):.4f} tok={metrics['tokens']}"
-                )
-            else:
-                accelerator.print(msg)
-        if cfg.swanlab_project and accelerator.is_main_process:
-            swanlab.log({
-                "train/loss": metrics["loss"],
-                "train/reverse_kl": metrics["rkl_metric"],
-                "train/forward_kl": metrics.get("fkl_metric", 0.0),
-                "train/tokens": metrics["tokens"],
-                "train/step": step,
-            }, step=step)
+                global_bar.update(1)
 
-        # Exact KL eval on a small subset
-        if cfg.eval_every > 0 and step % cfg.eval_every == 0:
-            with torch.no_grad():
-                k = min(4, len(prompts))
-                eval_prompts = prompts[-k:]
-                eval_prompts = apply_chat_format(tok, eval_prompts, cfg.use_chat_template, cfg.system_prompt)
-                seqs_cpu, plens, pad_id = generate_continuations(
-                    student, tok, eval_prompts,
-                    cfg.max_new_tokens, cfg.temperature, cfg.top_p,
-                    cfg.gen_micro_batch,
-                    cfg.progress and accelerator.is_main_process,
+            mean_loss = acc_loss / max(1, acc_count)
+            mean_rkl = acc_rkl / max(1, acc_tokens)
+            mean_fkl = acc_fkl / max(1, acc_tokens)
+
+            if accelerator.is_main_process and (update_step % 10 == 0 or update_step == 1):
+                msg = (
+                    f"step {update_step:05d}/{cfg.steps:05d} | "
+                    f"loss={mean_loss:.4f} rkl={mean_rkl:.4f} d_fkl={mean_fkl:.4f} tokens={acc_tokens}"
                 )
-                r_sum = torch.tensor(0.0, device=accelerator.device)
-                f_sum = torch.tensor(0.0, device=accelerator.device)
-                t_sum = torch.tensor(0.0, device=accelerator.device)
-                it_eval = range(0, seqs_cpu.size(0), max(1, cfg.lp_micro_batch))
-                for i_eval in it_eval:
-                    sl = slice(i_eval, i_eval + max(1, cfg.lp_micro_batch))
-                    ids_mb = seqs_cpu[sl].to(accelerator.device, non_blocking=True)
-                    am_mb = ids_mb.ne(pad_id).long()
-                    with accelerator.autocast():
-                        logits_s = student(input_ids=ids_mb, attention_mask=am_mb, use_cache=False).logits
-                        logits_t = teacher(input_ids=ids_mb, attention_mask=am_mb, use_cache=True).logits
-                        logp_s = nn.functional.log_softmax(logits_s, dim=-1)
-                        logp_t = nn.functional.log_softmax(logits_t, dim=-1)
-                    # per-position exact KL
-                    r_pos = per_position_exact_kl(logp_s, logp_t, kind="rkl")
-                    f_pos = per_position_exact_kl(logp_s, logp_t, kind="fkl")
+                if global_bar is not None:
+                    global_bar.set_postfix_str(
+                        f"loss={mean_loss:.4f} rkl={mean_rkl:.4f} fkl={mean_fkl:.4f} lr={current_lr:.2e} tok={acc_tokens}"
+                    )
+                else:
+                    accelerator.print(msg)
+            if cfg.swanlab_project and accelerator.is_main_process:
+                swanlab.log({
+                    "train/loss": mean_loss,
+                    "train/reverse_kl": mean_rkl,
+                    "train/forward_kl": mean_fkl,
+                    "train/grad_norm": float(grad_norm),
+                    "train/lr": float(current_lr),
+                    "train/tokens": acc_tokens,
+                    "train/step": update_step,
+                }, step=update_step)
+
+            acc_loss = 0.0
+            acc_rkl = 0.0
+            acc_fkl = 0.0
+            acc_tokens = 0
+            acc_count = 0
+            # Exact KL eval on a small subset
+            if cfg.eval_exact_kl and cfg.eval_every > 0 and update_step % cfg.eval_every == 0:
+                with torch.no_grad():
+                    k = min(4, len(prompts))
+                    eval_prompts = prompts[-k:]
+                    eval_prompts = apply_chat_format(tok, eval_prompts, cfg.system_prompt)
+                    seqs_cpu, plens, pad_id = generate_continuations(
+                        student, tok, eval_prompts,
+                        cfg.max_tokens, cfg.temperature, cfg.top_p,
+                        cfg.gen_micro_batch,
+                        cfg.progress and accelerator.is_main_process,
+                    )
+                    r_sum = torch.tensor(0.0, device=accelerator.device)
+                    f_sum = torch.tensor(0.0, device=accelerator.device)
+                    t_sum = torch.tensor(0.0, device=accelerator.device)
+                    it_eval = range(0, seqs_cpu.size(0), max(1, cfg.lp_micro_batch))
+                    for i_eval in it_eval:
+                        sl = slice(i_eval, i_eval + max(1, cfg.lp_micro_batch))
+                        ids_mb = seqs_cpu[sl].to(accelerator.device, non_blocking=True)
+                        am_mb = ids_mb.ne(pad_id).long()
+                        with accelerator.autocast():
+                            logits_s = student(input_ids=ids_mb, attention_mask=am_mb, use_cache=False).logits
+                            logits_t = teacher(input_ids=ids_mb, attention_mask=am_mb, use_cache=False).logits
+                            logp_s = nn.functional.log_softmax(logits_s, dim=-1)
+                            logp_t = nn.functional.log_softmax(logits_t, dim=-1)
+                        # per-position exact KL
+                        r_pos = per_position_exact_kl(logp_s, logp_t, kind="rkl")
+                        f_pos = per_position_exact_kl(logp_s, logp_t, kind="fkl")
                     # valid mask: continuation and non-pad
                     cont_mb = torch.zeros_like(r_pos, dtype=torch.bool)
                     for j, L in enumerate(plens[sl]):
-                        start_j = max(L - 1, 0)
+                        nonpad = am_mb[j].nonzero()
+                        if len(nonpad) == 0:
+                            continue
+                        first_nonpad = int(nonpad[0].item())
+                        start_j = max(first_nonpad + L - 1, 0)
                         cont_mb[j, start_j:] = True
-                    valid_mb = cont_mb & am_mb[:, 1:].bool()
-                    r_sum = r_sum + r_pos.masked_select(valid_mb).sum()
-                    f_sum = f_sum + f_pos.masked_select(valid_mb).sum()
-                    t_sum = t_sum + valid_mb.sum()
-                # aggregate across ranks
-                r_all = accelerator.gather_for_metrics(r_sum).sum()
-                f_all = accelerator.gather_for_metrics(f_sum).sum()
-                t_all = accelerator.gather_for_metrics(t_sum).sum()
-                rkl_exact = (r_all / t_all).item() if t_all.item() > 0 else 0.0
-                fkl_exact = (f_all / t_all).item() if t_all.item() > 0 else 0.0
-                if accelerator.is_main_process:
-                    accelerator.print(f"eval rkl_exact={rkl_exact:.4f} fkl_exact={fkl_exact:.4f}")
-                if cfg.swanlab_project and accelerator.is_main_process:
-                    swanlab.log({
-                        "eval/rkl_exact": rkl_exact,
-                        "eval/fkl_exact": fkl_exact,
-                        "train/step": step,
-                    }, step=step)
+                        valid_mb = cont_mb & am_mb[:, 1:].bool()
+                        r_sum = r_sum + r_pos.masked_select(valid_mb).sum()
+                        f_sum = f_sum + f_pos.masked_select(valid_mb).sum()
+                        t_sum = t_sum + valid_mb.sum()
+                    # aggregate across ranks
+                    r_all = accelerator.gather_for_metrics(r_sum).sum()
+                    f_all = accelerator.gather_for_metrics(f_sum).sum()
+                    t_all = accelerator.gather_for_metrics(t_sum).sum()
+                    rkl_exact = (r_all / t_all).item() if t_all.item() > 0 else 0.0
+                    fkl_exact = (f_all / t_all).item() if t_all.item() > 0 else 0.0
+                    if accelerator.is_main_process:
+                        accelerator.print(f"eval rkl_exact={rkl_exact:.4f} fkl_exact={fkl_exact:.4f}")
+                    if cfg.swanlab_project and accelerator.is_main_process:
+                        swanlab.log({
+                            "eval/rkl_exact": rkl_exact,
+                            "eval/fkl_exact": fkl_exact,
+                            "train/step": update_step,
+                        }, step=update_step)
 
-        if accelerator.is_main_process and cfg.save_every > 0 and step % cfg.save_every == 0:
-            ckpt_dir = os.path.join(cfg.output_dir, f"step-{step}")
-            os.makedirs(ckpt_dir, exist_ok=True)
-            to_save = accelerator.unwrap_model(student)
-            to_save.save_pretrained(ckpt_dir)
-            tok.save_pretrained(ckpt_dir)
-            accelerator.print(f"已保存检查点到 {ckpt_dir}")
+            if accelerator.is_main_process and cfg.save_every > 0 and update_step % cfg.save_every == 0:
+                ckpt_dir = os.path.join(cfg.output_dir, f"step-{update_step}")
+                os.makedirs(ckpt_dir, exist_ok=True)
+                to_save = accelerator.unwrap_model(student)
+                to_save.save_pretrained(ckpt_dir)
+                tok.save_pretrained(ckpt_dir)
+                accelerator.print(f"已保存检查点到 {ckpt_dir}")
 
     if accelerator.is_main_process:
         if global_bar is not None:
             global_bar.close()
-        to_save = accelerator.unwrap_model(student)
-        to_save.save_pretrained(cfg.output_dir)
-        tok.save_pretrained(cfg.output_dir)
+
+        if update_step % cfg.save_every != 0:
+            ckpt_dir = os.path.join(cfg.output_dir, f"step-{update_step}")
+            os.makedirs(ckpt_dir, exist_ok=True)
+            to_save = accelerator.unwrap_model(student)
+            to_save.save_pretrained(ckpt_dir)
+            tok.save_pretrained(ckpt_dir)
+        
         accelerator.print(f"训练完成，模型已保存到 {cfg.output_dir}")
         if cfg.swanlab_project and SWANLAB_AVAILABLE:
-            finish = getattr(swanlab, "finish", None)
-            if callable(finish):
-                finish()
+            try:
+                finish = getattr(swanlab, "finish", None)
+                if callable(finish):
+                    finish()
+            except Exception as e:
+                accelerator.print(f"[warn] swanlab.finish() failed: {e}")
+    
+    # ===== 新增：显式清理分布式进程组 =====
+    accelerator.wait_for_everyone()  # 确保所有进程同步
+    accelerator.free_memory()  # 释放缓存的内存
+    
+    # 如果使用了 DeepSpeed，先清理 DeepSpeed
+    if cfg.teacher_ds_zero3 and DEEPSPEED_AVAILABLE:
+        if hasattr(teacher, 'destroy'):
+            teacher.destroy()
+    
+    # 清理分布式环境
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()  # 最后一次同步
+        torch.distributed.destroy_process_group()
+    
+    # 清理 CUDA 缓存
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
 
 def parse_args() -> Config:
@@ -584,16 +812,20 @@ def parse_args() -> Config:
     p.add_argument("--student_model", type=str, required=True)
     p.add_argument("--teacher_model", type=str, required=True)
     p.add_argument("--output_dir", type=str, default="./dual-kl-out")
-    p.add_argument("--steps", type=int, default=1000)
-    p.add_argument("--batch_size", type=int, default=2)
+    p.add_argument("--steps", type=int, default=150)
+    p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--group_size", type=int, default=1)
-    p.add_argument("--max_new_tokens", type=int, default=128)
-    p.add_argument("--temperature", type=float, default=0.8)
-    p.add_argument("--top_p", type=float, default=0.95)
-    p.add_argument("--learning_rate", type=float, default=5e-5)
+    p.add_argument("--max_tokens", type=int, default=2048, help="生成总长度上限（含 prompt）")
+    p.add_argument("--temperature", type=float, default=1)
+    p.add_argument("--top_p", type=float, default=1.0)
+    p.add_argument("--learning_rate", type=float, default=1e-5)
     p.add_argument("--weight_decay", type=float, default=0.0)
+    p.add_argument("--warmup_steps", type=int, default=0, help="学习率 warmup 步数（>0 则优先使用）")
+    p.add_argument("--warmup_ratio", type=float, default=0.03, help="学习率 warmup 比例（当 warmup_steps=0 时生效）")
+    p.add_argument("--lr_decay", type=str, default="linear", choices=["cosine", "linear", "none"])
+    p.add_argument("--min_lr_ratio", type=float, default=0.01, help="decay 最小学习率比例（相对 base lr）")
     # rKL/fKL 均为 MC 实现，无需额外开关
-    p.add_argument("--save_every", type=int, default=100)
+    p.add_argument("--save_every", type=int, default=25)
     p.add_argument("--prompts_file", type=str, default=None)
     p.add_argument("--dataset", type=str, default=None)
     p.add_argument(
@@ -606,14 +838,18 @@ def parse_args() -> Config:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--use_lora", action="store_true")
     p.add_argument("--lora_r", type=int, default=32)
-    p.add_argument("--lora_alpha", type=int, default=16)
-    p.add_argument("--lora_dropout", type=float, default=0.05)
+    p.add_argument("--lora_alpha", type=int, default=None)
+    p.add_argument("--lora_dropout", type=float, default=0.0)
     p.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"])
     p.add_argument("--grad_accum", type=int, default=1)
-    p.add_argument("--eval_every", type=int, default=100)
+    p.add_argument("--eval_every", type=int, default=25)
+    p.add_argument("--no_eval_exact_kl", action="store_true")
+    p.add_argument("--no_print_sample", action="store_true")
+    p.add_argument("--print_every", type=int, default=1)
+    p.add_argument("--debug_mask", action="store_true")
     p.add_argument("--swanlab_project", type=str, default=None)
     p.add_argument("--swanlab_name", type=str, default=None)
-    p.add_argument("--swanlab_mode", type=str, default="online", choices=["online", "offline", "disabled"])
+    p.add_argument("--swanlab_mode", type=str, default="offline", choices=["online", "offline", "disabled"])
     p.add_argument("--teacher_ds_zero3", action="store_true")
     p.add_argument("--teacher_ds_config", type=str, default=None)
     p.add_argument("--gen_micro_batch", type=int, default=8)
@@ -623,13 +859,13 @@ def parse_args() -> Config:
     p.add_argument("--lam_f", type=float, default=1.0, help="fKL 基础权重（叠加位置衰减），范围 0..1")
     p.add_argument("--fkl_pos_decay", action="store_true", help="启用 fKL 的位置衰减权重：pos_ratio = 1 - pos_in_seq/seq_len")
     # Chat formatting
-    p.add_argument("--use_chat_template", action="store_true", help="使用 tokenizer.apply_chat_template 构造 system/user 对话提示")
     p.add_argument(
         "--system_prompt",
         type=str,
         default="Please reason step by step, and put your final answer within \\boxed{{}}.",
         help="可选的系统提示（作为 system role 或文本前缀）",
     )
+    p.add_argument("--resume_from_step", type=int, default=0, help="从指定 step 的 checkpoint 恢复训练")
     a = p.parse_args()
     return Config(
         student_model=a.student_model,
@@ -638,11 +874,15 @@ def parse_args() -> Config:
         steps=a.steps,
         batch_size=a.batch_size,
         group_size=a.group_size,
-        max_new_tokens=a.max_new_tokens,
+        max_tokens=a.max_tokens,
         temperature=a.temperature,
         top_p=a.top_p,
         learning_rate=a.learning_rate,
         weight_decay=a.weight_decay,
+        warmup_steps=a.warmup_steps,
+        warmup_ratio=a.warmup_ratio,
+        lr_decay=a.lr_decay,
+        min_lr_ratio=a.min_lr_ratio,
         save_every=a.save_every,
         prompts_file=a.prompts_file,
         dataset=a.dataset,
@@ -651,11 +891,15 @@ def parse_args() -> Config:
         seed=a.seed,
         use_lora=a.use_lora,
         lora_r=a.lora_r,
-        lora_alpha=a.lora_alpha,
+        lora_alpha=a.lora_alpha if a.lora_alpha is not None else a.lora_r,
         lora_dropout=a.lora_dropout,
         dtype=a.dtype,
         grad_accum=a.grad_accum,
         eval_every=a.eval_every,
+        eval_exact_kl=not a.no_eval_exact_kl,
+        print_sample=not a.no_print_sample,
+        print_every=a.print_every,
+        debug_mask=bool(a.debug_mask),
         swanlab_project=a.swanlab_project,
         swanlab_name=a.swanlab_name,
         swanlab_mode=a.swanlab_mode,
@@ -667,8 +911,8 @@ def parse_args() -> Config:
         lam_r=max(0.0, min(1.0, a.lam_r)),
         lam_f=max(0.0, min(1.0, a.lam_f)),
         fkl_pos_decay=bool(a.fkl_pos_decay),
-        use_chat_template=bool(a.use_chat_template),
         system_prompt=a.system_prompt,
+        resume_from_step=a.resume_from_step,
     )
 
 

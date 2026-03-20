@@ -1,4 +1,4 @@
-name: dualkl
+name: dkl
 channels:
   - pytorch
   - nvidia
