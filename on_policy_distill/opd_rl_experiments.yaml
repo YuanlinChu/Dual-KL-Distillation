@@ -85,9 +85,11 @@ base:
   # dual-KL 框架开关
   # lam_r 控制 RL 主分支（rKL advantage）
   # lam_f 控制 teacher-sampled fKL 辅助分支
+  # fkl_decay_until 控制 fKL 在训练前多少期内线性衰减到 0
   lam_r: 1.0
   lam_f: 0.0
   use_fkl: false
+  fkl_decay_until: 0.3
 
 # 标准 RL 风格 OPD 基线：
 # 只使用 rKL，不使用 fKL。这个实验是最重要的对照组。
@@ -102,29 +104,43 @@ standard_opd:
   num_substeps: 1
 
 # dual-KL 主实验：
-# 在相同 RL 框架下，保留 rKL 主分支，并加入等权重的 fKL 辅助分支。
-# 用来回答“在完整 RL 训练骨架里，引入 fKL 是否有效”。
+# 在相同 RL 框架下，训练初期加入等权重 fKL，把学生快速拉向教师分布；
+# 之后在前 30% 训练内线性衰减到 0，后面退化为纯 rKL OPD。
+# 这是你当前最关心的主方案。
 dual_kl_equal:
   output_dir: "./out/opd-rl-r1f1"
   lam_r: 1.0
   lam_f: 1.0
   use_fkl: true
+  fkl_decay_until: 0.3
 
 # 弱 fKL 辅助实验：
-# 用来观察很小的 fKL 权重是否已经能带来收益。
+# 用来观察较小初始 fKL 权重是否已经足够在训练前期稳定住模型。
 dual_kl_mild_f:
   output_dir: "./out/opd-rl-r1f0.2"
   lam_r: 1.0
   lam_f: 0.2
   use_fkl: true
+  fkl_decay_until: 0.3
 
 # 中等 fKL 辅助实验：
-# 作为 lam_f=0.2 和 lam_f=1.0 之间的中间点，方便做趋势分析。
+# 作为 lam_f=0.2 和 lam_f=1.0 之间的中间点，方便看初始 fKL 强度趋势。
 dual_kl_mid_f:
   output_dir: "./out/opd-rl-r1f0.5"
   lam_r: 1.0
   lam_f: 0.5
   use_fkl: true
+  fkl_decay_until: 0.3
+
+# 常开 fKL 的对照实验：
+# 这个实验专门用来验证“fKL 一直存在对数学蒸馏是否反而有害”。
+# 如果你观察到它明显弱于衰减版，那么就能支持你现在的假设。
+dual_kl_always_on:
+  output_dir: "./out/opd-rl-r1f1-alwayson"
+  lam_r: 1.0
+  lam_f: 1.0
+  use_fkl: true
+  fkl_decay_until: 0.0
 
 # 重要性采样消融实验：
 # 不用 PPO clipping，而是直接用 importance sampling 形式的 RL loss。

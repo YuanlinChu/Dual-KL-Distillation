@@ -97,6 +97,7 @@ class Config:
     lam_r: float = 1.0
     lam_f: float = 0.0
     use_fkl: bool = False
+    fkl_decay_until: float = 0.3
     swanlab_project: str | None = None
     swanlab_name: str | None = None
     swanlab_mode: str = "offline"
@@ -115,6 +116,7 @@ class RolloutBatch:
     prompt_lengths: List[int]
     pad_id: int
     group_count: int
+    fkl_weight: float
     sample_prompt: str = ""
     sample_cont: str = ""
 
@@ -267,6 +269,19 @@ def discounted_future_sum(x: torch.Tensor, gamma: float) -> torch.Tensor:
     return y
 
 
+def scheduled_fkl_weight(step: int, total_steps: int, cfg: Config) -> float:
+    if not cfg.use_fkl or cfg.lam_f <= 0.0:
+        return 0.0
+    if cfg.fkl_decay_until <= 0.0:
+        return float(cfg.lam_f)
+    progress = float(step) / float(max(1, total_steps))
+    if progress >= cfg.fkl_decay_until:
+        return 0.0
+    remain_ratio = 1.0 - (progress / max(cfg.fkl_decay_until, 1e-8))
+    remain_ratio = min(max(remain_ratio, 0.0), 1.0)
+    return float(cfg.lam_f) * remain_ratio
+
+
 def generate_continuations(
     model: PreTrainedModel,
     tok: PreTrainedTokenizerBase,
@@ -342,6 +357,7 @@ def compute_rollout_logprobs(
     lp_micro_batch: int,
     pad_id: int,
     accelerator: Accelerator,
+    compute_fkl_samples: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     old_chunks: List[torch.Tensor] = []
     teacher_chunks: List[torch.Tensor] = []
@@ -360,23 +376,34 @@ def compute_rollout_logprobs(
                 logp_t = nn.functional.log_softmax(logits_t, dim=-1)
                 old_chunks.append(logp_s[:, :-1, :].gather(-1, ids_mb[:, 1:].unsqueeze(-1)).squeeze(-1).float().cpu())
                 teacher_chunks.append(logp_t[:, :-1, :].gather(-1, ids_mb[:, 1:].unsqueeze(-1)).squeeze(-1).float().cpu())
-                probs_t = logp_t[:, :-1, :].exp()
-                bsz, seq_len, vocab = probs_t.shape
-                sampled = torch.multinomial(probs_t.reshape(-1, vocab), num_samples=1).reshape(bsz, seq_len)
-                sampled_token_chunks.append(sampled.cpu())
-                sampled_student_chunks.append(
-                    logp_s[:, :-1, :].gather(-1, sampled.unsqueeze(-1)).squeeze(-1).float().cpu()
-                )
-                sampled_teacher_chunks.append(
-                    logp_t[:, :-1, :].gather(-1, sampled.unsqueeze(-1)).squeeze(-1).float().cpu()
-                )
+                if compute_fkl_samples:
+                    probs_t = logp_t[:, :-1, :].exp()
+                    bsz, seq_len, vocab = probs_t.shape
+                    sampled = torch.multinomial(probs_t.reshape(-1, vocab), num_samples=1).reshape(bsz, seq_len)
+                    sampled_token_chunks.append(sampled.cpu())
+                    sampled_student_chunks.append(
+                        logp_s[:, :-1, :].gather(-1, sampled.unsqueeze(-1)).squeeze(-1).float().cpu()
+                    )
+                    sampled_teacher_chunks.append(
+                        logp_t[:, :-1, :].gather(-1, sampled.unsqueeze(-1)).squeeze(-1).float().cpu()
+                    )
             del ids_mb, attn_mb, logits_s, logits_t
+    old_all = torch.cat(old_chunks, dim=0)
+    teacher_all = torch.cat(teacher_chunks, dim=0)
+    if compute_fkl_samples:
+        sampled_tokens = torch.cat(sampled_token_chunks, dim=0)
+        sampled_student = torch.cat(sampled_student_chunks, dim=0)
+        sampled_teacher = torch.cat(sampled_teacher_chunks, dim=0)
+    else:
+        sampled_tokens = torch.zeros_like(old_all, dtype=torch.long)
+        sampled_student = torch.zeros_like(old_all)
+        sampled_teacher = torch.zeros_like(old_all)
     return (
-        torch.cat(old_chunks, dim=0),
-        torch.cat(teacher_chunks, dim=0),
-        torch.cat(sampled_token_chunks, dim=0),
-        torch.cat(sampled_student_chunks, dim=0),
-        torch.cat(sampled_teacher_chunks, dim=0),
+        old_all,
+        teacher_all,
+        sampled_tokens,
+        sampled_student,
+        sampled_teacher,
     )
 
 
@@ -399,7 +426,9 @@ def collect_rollout_batch(
     prompts: List[str],
     cfg: Config,
     accelerator: Accelerator,
+    step: int,
 ) -> RolloutBatch:
+    fkl_weight = scheduled_fkl_weight(step, cfg.steps, cfg)
     seqs_cpu, prompt_lengths, pad_id = generate_continuations(
         student,
         tok,
@@ -423,6 +452,7 @@ def collect_rollout_batch(
         cfg.lp_micro_batch,
         pad_id,
         accelerator,
+        compute_fkl_samples=fkl_weight > 0.0,
     )
     advantages_cpu = -cfg.kl_coef * (old_logprobs_cpu - teacher_logprobs_cpu)
     if cfg.kl_discount > 0 and advantages_cpu.numel() > 0:
@@ -469,6 +499,7 @@ def collect_rollout_batch(
         prompt_lengths=prompt_lengths,
         pad_id=pad_id,
         group_count=max(1, seqs_cpu.size(0) // max(1, cfg.group_size)),
+        fkl_weight=fkl_weight,
         sample_prompt=sample_prompt,
         sample_cont=sample_cont,
     )
@@ -502,7 +533,7 @@ def rl_update_substep(
     entropy_sum = torch.tensor(0.0, device=accelerator.device)
     fkl_loss_sum = torch.tensor(0.0, device=accelerator.device)
     token_sum = torch.tensor(0.0, device=accelerator.device)
-    use_fkl = bool(cfg.use_fkl and cfg.lam_f > 0.0)
+    use_fkl = rollout.fkl_weight > 0.0
 
     mb = max(1, cfg.lp_micro_batch)
     optimizer.zero_grad(set_to_none=True)
@@ -543,7 +574,7 @@ def rl_update_substep(
             if use_fkl and teacher_tokens_mb is not None:
                 cur_teacher_lp = logp_all[:, :-1, :].gather(-1, teacher_tokens_mb.unsqueeze(-1)).squeeze(-1)
                 fkl_loss_pos = -cur_teacher_lp
-                total_loss_pos = total_loss_pos + cfg.lam_f * fkl_loss_pos
+                total_loss_pos = total_loss_pos + rollout.fkl_weight * fkl_loss_pos
             loss_mb = total_loss_pos.masked_select(valid_mb).sum() / float(max(1, total_valid_tokens))
 
         is_last = (i + mb) >= rollout.input_ids_cpu.size(0)
@@ -585,15 +616,27 @@ def rollout_metrics(rollout: RolloutBatch, accelerator: Accelerator) -> dict:
     valid = rollout.valid_mask_cpu
     tokens = int(valid.sum().item())
     if tokens == 0:
-        return {"reverse_kl": 0.0, "forward_kl_mc": 0.0, "reward": 0.0, "advantages": 0.0, "tokens": 0}
+        return {
+            "reverse_kl": 0.0,
+            "forward_kl_mc": 0.0,
+            "fkl_weight": rollout.fkl_weight,
+            "reward": 0.0,
+            "advantages": 0.0,
+            "tokens": 0,
+        }
     rkl = ((rollout.old_logprobs_cpu - rollout.teacher_logprobs_cpu) * valid.float()).sum() / max(1, tokens)
-    fkl = (
-        (rollout.teacher_sampled_teacher_logprobs_cpu - rollout.teacher_sampled_student_logprobs_cpu) * valid.float()
-    ).sum() / max(1, tokens)
+    if rollout.fkl_weight > 0.0:
+        fkl = (
+            (rollout.teacher_sampled_teacher_logprobs_cpu - rollout.teacher_sampled_student_logprobs_cpu) * valid.float()
+        ).sum() / max(1, tokens)
+        fkl_val = float(fkl.item())
+    else:
+        fkl_val = 0.0
     adv = rollout.advantages_cpu.masked_select(valid).mean()
     return {
         "reverse_kl": float(rkl.item()),
-        "forward_kl_mc": float(fkl.item()),
+        "forward_kl_mc": fkl_val,
+        "fkl_weight": rollout.fkl_weight,
         "reward": 0.0,
         "advantages": float(adv.item()),
         "tokens": tokens,
@@ -723,7 +766,7 @@ def main(cfg: Config) -> None:
         if cfg.max_prompt_tokens is not None:
             batch_prompts = [truncate_by_tokens(tok, p, cfg.max_prompt_tokens) for p in batch_prompts]
 
-        rollout = collect_rollout_batch(student, teacher, tok, batch_prompts, cfg, accelerator)
+        rollout = collect_rollout_batch(student, teacher, tok, batch_prompts, cfg, accelerator, step)
         rollout_stat = rollout_metrics(rollout, accelerator)
 
         substep_metrics: List[dict] = []
@@ -754,12 +797,13 @@ def main(cfg: Config) -> None:
             msg = (
                 f"step {step:05d}/{cfg.steps:05d} | loss={mean_loss:.4f} "
                 f"rkl={rollout_stat['reverse_kl']:.4f} ratio={mean_ratio:.4f} "
-                f"fkl={rollout_stat['forward_kl_mc']:.4f} fkl_loss={mean_fkl_loss:.4f} clip={mean_clip:.4f} "
+                f"fkl={rollout_stat['forward_kl_mc']:.4f} fkl_w={rollout_stat['fkl_weight']:.4f} "
+                f"fkl_loss={mean_fkl_loss:.4f} clip={mean_clip:.4f} "
                 f"post_kl={mean_post_kl:.4f} tok={rollout_stat['tokens']}"
             )
             if global_bar is not None:
                 global_bar.set_postfix_str(
-                    f"loss={mean_loss:.4f} rkl={rollout_stat['reverse_kl']:.4f} fkl={rollout_stat['forward_kl_mc']:.4f} lr={current_lr:.2e}"
+                    f"loss={mean_loss:.4f} rkl={rollout_stat['reverse_kl']:.4f} fkl_w={rollout_stat['fkl_weight']:.3f} lr={current_lr:.2e}"
                 )
             else:
                 accelerator.print(msg)
@@ -770,6 +814,7 @@ def main(cfg: Config) -> None:
                     "train/reverse_kl": rollout_stat["reverse_kl"],
                     "train/forward_kl_mc": rollout_stat["forward_kl_mc"],
                     "train/fkl_loss": mean_fkl_loss,
+                    "train/fkl_weight": rollout_stat["fkl_weight"],
                     "train/ratio": mean_ratio,
                     "train/clip_frac": mean_clip,
                     "train/approx_kl": mean_post_kl,
@@ -918,6 +963,7 @@ def parse_args() -> Config:
     p.add_argument("--lam_r", type=float, default=1.0)
     p.add_argument("--lam_f", type=float, default=0.0)
     p.add_argument("--use_fkl", action="store_true")
+    p.add_argument("--fkl_decay_until", type=float, default=0.3, help="fKL 线性衰减到 0 的训练进度比例；0 表示不衰减")
     p.add_argument("--swanlab_project", type=str, default=None)
     p.add_argument("--swanlab_name", type=str, default=None)
     p.add_argument("--swanlab_mode", type=str, default="offline", choices=["online", "offline", "disabled"])
@@ -976,6 +1022,7 @@ def parse_args() -> Config:
         lam_r=max(0.0, a.lam_r),
         lam_f=max(0.0, a.lam_f),
         use_fkl=bool(a.use_fkl),
+        fkl_decay_until=max(0.0, a.fkl_decay_until),
         swanlab_project=a.swanlab_project,
         swanlab_name=a.swanlab_name,
         swanlab_mode=a.swanlab_mode,
