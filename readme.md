@@ -27,8 +27,8 @@
 
 设：
 
-- 学生旧策略为 `\pi_old`
-- 当前训练中的学生策略为 `\pi_\theta`
+- 学生旧策略为 $ \pi_{old} $
+- 当前训练中的学生策略为 $ \pi_\theta $
 - 教师策略为 `q`
 - 输入 prompt 为 `x`
 - 学生生成响应为 `y = (y_1, y_2, ..., y_T)`
@@ -41,7 +41,7 @@ $$
 
 它的直观意义是：
 
-- 如果学生在自己采到的 token 上比教师更自信，则 `\Delta_t^{(r)} > 0`
+- 如果学生在自己采到的 token 上比教师更自信，则 $ \Delta_t^{(r)} > 0 $
 - 这说明学生可能在错误模式上过度集中
 - 那么更新应压低这类 token 的概率
 
@@ -82,7 +82,7 @@ $$
 每个训练 step 的流程如下：
 
 1. 从数据集中取一批 prompt。
-2. 学生按当前策略 `\pi_old` 采样生成若干条回答。
+2. 学生按当前策略 $ \pi_\theta $ 采样生成若干条回答。
 3. 在这些学生轨迹上，计算：
    - 学生旧 logprob
    - 教师 logprob
@@ -100,45 +100,45 @@ $$
 
 学生先生成：
 
-\[
+$$
 y \sim \pi_{\text{old}}(\cdot \mid x)
-\]
+$$
 
 对每个位置 `t`，定义学生路径上的 `reverse KL` Monte Carlo 差值：
 
-\[
+$$
 \Delta_t^{(r)} =
 \log \pi_{\text{old}}(y_t \mid x, y_{<t})
 - \log q(y_t \mid x, y_{<t})
-\]
+$$
 
 ## 5.2 rKL advantage
 
 我们将其转成 RL 里的 token-level advantage：
 
-\[
+$$
 A_t^{(r)} = -\lambda_{\text{coef}} \, \Delta_t^{(r)}
-\]
+$$
 
 其中：
 
-- `\lambda_coef` 对应代码中的 `kl_coef`
+- $ \lambda_{\text{coef}} $ 对应代码中的 `kl_coef`
 - 默认建议取 `1`
 
 如果开启未来折扣，则进一步构造：
 
-\[
+$$
 \tilde A_t^{(r)} =
 \sum_{u=t}^{T}\gamma^{u-t} A_u^{(r)}
-\]
+$$
 
-其中 `\gamma` 对应 `kl_discount`。
+其中 $ \gamma $ 对应 `kl_discount`。
 
 在标准 baseline 里，我们建议：
 
-\[
+$$
 \lambda_{\text{coef}} = 1, \quad \gamma = 0
-\]
+$$
 
 即不额外放大，也不做未来折扣。
 
@@ -146,60 +146,60 @@ A_t^{(r)} = -\lambda_{\text{coef}} \, \Delta_t^{(r)}
 
 令：
 
-\[
+$$
 \rho_t(\theta) =
 \exp\Big(
 \log \pi_\theta(y_t \mid x, y_{<t})
 - \log \pi_{\text{old}}(y_t \mid x, y_{<t})
 \Big)
-\]
+$$
 
 如果使用 PPO，则 rKL 主分支为：
 
-\[
+$$
 L_t^{(r)}(\theta)
 =
 -\min\Big(
 \rho_t(\theta)\tilde A_t^{(r)},
 \text{clip}(\rho_t(\theta), 1-\epsilon_l, 1+\epsilon_h)\tilde A_t^{(r)}
 \Big)
-\]
+$$
 
 如果使用 importance sampling，则为：
 
-\[
+$$
 L_t^{(r)}(\theta)
 =
 - \rho_t(\theta)\tilde A_t^{(r)}
-\]
+$$
 
-再乘上 rKL 主分支的权重 `\lambda_r`：
+再乘上 rKL 主分支的权重 $ \lambda_r $ ：
 
-\[
+$$
 L_{t,\text{weighted}}^{(r)} = \lambda_r L_t^{(r)}
-\]
+$$
 
 通常默认：
 
-\[
+$$
 \lambda_r = 1
-\]
+$$
 
 ### 5.4 教师路径采样的 fKL 辅助项
 
-当 `fKL` 开启时，我们在相同上下文 `(x, y_{<t})` 下，从教师分布采样：
+当 `fKL` 开启时，我们在相同上下文 $ (x, y_{<t}) $ 下，从教师分布采样：
 
-\[
+$$
 z_t \sim q(\cdot \mid x, y_{<t})
-\]
+$$
 
 并构造学生在教师采样 token 上的负对数似然：
 
-\[
+$$
 L_t^{(f)}(\theta)
 =
 - \log \pi_\theta(z_t \mid x, y_{<t})
-\]
+$$
 
 这项损失的作用不是让学生永远覆盖教师分布，而是在训练初期给学生提供“定位教师支持集”的能力。
 
@@ -209,17 +209,17 @@ L_t^{(f)}(\theta)
 
 则我们定义：
 
-\[
+$$
 \lambda_f^{(s)} =
 \begin{cases}
 \lambda_f \left(1 - \frac{s/T}{p}\right), & s/T < p \\
 0, & s/T \ge p
 \end{cases}
-\]
+$$
 
 含义是：
 
-- 第 0 步时，`fKL` 权重为初始值 `\lambda_f`
+- 第 0 步时，`fKL` 权重为初始值 $ \lambda_f $  
 - 在训练前 `p` 比例的 step 中，线性下降
 - 当训练进度达到 `p` 后，`fKL` 权重变为 0
 - 之后训练完全退化为纯 `rKL` OPD
@@ -230,23 +230,23 @@ L_t^{(f)}(\theta)
 
 最终每个位置的总损失写为：
 
-\[
+$$
 L_t(\theta)
 =
-\lambda_r L_t^{(r)}(\theta)
+\lambda_r L_t^{(r)}(\theta) + 
  \lambda_f^{(s)} L_t^{(f)}(\theta)
-\]
+$$
 
 只在 continuation 且非 pad 的位置上累积：
 
-\[
+$$
 L(\theta)
 =
 \frac{1}{|\mathcal V|}
 \sum_{t \in \mathcal V} L_t(\theta)
-\]
+$$
 
-其中 `\mathcal V` 是有效 token 位置集合。
+其中 $ \mathcal V $ 是有效 token 位置集合。
 
 ## 6. 为什么这样做
 
@@ -295,9 +295,9 @@ L(\theta)
 
 当：
 
-\[
+$$
 \lambda_r = 1,\quad \lambda_f = 0
-\]
+$$
 
 时，本方法退化为标准的 RL-style OPD。
 
@@ -305,9 +305,9 @@ L(\theta)
 
 当：
 
-\[
+$$
 \lambda_f^{(s)} = \lambda_f \quad \text{for all } s
-\]
+$$
 
 即 `fkl_decay_until = 0` 时，本方法退化为“始终保留 fKL”的 dual-KL 训练。
 
