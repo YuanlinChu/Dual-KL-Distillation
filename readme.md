@@ -1,630 +1,383 @@
-# baseline: on-policy distillation   / tulu3
-accelerate launch --config_file accelerate_config_multi_gpu.yaml \
-  -m on_policy_distill.train_on_policy_local \
-  --student_model Qwen/Qwen3-4B --teacher_model Qwen/Qwen3-32B \
-  --dataset tulu3 --batch_size 8 --group_size 4 --grad_accum 8 \
-  --gen_micro_batch 4 --lp_micro_batch 4 --kl_coef 1.0 --kl_discount 0.0 \
-  --max_new_tokens 512 --max_prompt_tokens 128 --use_lora --lora_r 64 --dtype bf16 \
-  --wandb_project opd-distill --wandb_name opd-4b-32b \
-  --teacher_ds_zero3 --output_dir ./out/opd-4b-32b \
-  --no_progress
-
-# baseline: on-policy distillation   / deepmath
-accelerate launch --config_file accelerate_config_multi_gpu.yaml \
-  -m on_policy_distill.train_on_policy_local \
-  --student_model Qwen/Qwen3-4B --teacher_model Qwen/Qwen3-32B \
-  --dataset deepmath --batch_size 4 --group_size 4 --grad_accum 4 \
-  --gen_micro_batch 2 --lp_micro_batch 2 --kl_coef 1.0 --kl_discount 0.0 \
-  --max_new_tokens 1024 --max_prompt_tokens 128 --use_lora --lora_r 64 --dtype bf16 \
-  --wandb_project opd-distill --wandb_name opd-4b-32b-deepmath \
-  --teacher_ds_zero3 --output_dir ./out/opd-4b-32b-deepmath \
-  --no_progress
-
-# 新版 (mc-1 修改了fkl的方向)
-accelerate launch --config_file accelerate_config_multi_gpu.yaml \
-  -m dual_kl.train_dualkl_new \
-  --student_model Qwen/Qwen3-4B --teacher_model Qwen/Qwen3-32B \
-  --dataset tulu3 --batch_size 8 --group_size 4 --grad_accum 8 \
-  --max_new_tokens 512 --max_prompt_tokens 128 --use_lora --lora_r 64 --dtype bf16 \
-  --wandb_project dualkl-distill --wandb_name qwen4b_dualkl_mc-1 \
-  --teacher_ds_zero3 --gen_micro_batch 4 --lp_micro_batch 4 \
-  --output_dir ./out/dual-kl-mc-1 \
-  --no_progress
-
-
-# 新版（mc-2 修改了fkl的loss计算方式）
-accelerate launch --config_file accelerate_config_multi_gpu.yaml \
-  -m dual_kl.train_dualkl_new_2 \
-  --student_model Qwen/Qwen3-4B --teacher_model Qwen/Qwen3-32B \
-  --dataset tulu3 --batch_size 8 --group_size 4 --grad_accum 8 \
-  --max_new_tokens 512 --max_prompt_tokens 128 --use_lora --lora_r 64 --dtype bf16 \
-  --wandb_project dualkl-distill --wandb_name qwen4b_dualkl_mc-2 \
-  --teacher_ds_zero3 --gen_micro_batch 4 --lp_micro_batch 4 \
-  --output_dir ./out/dual-kl-mc-2 \
-  --no_progress
-
-## deepmath
-accelerate launch --config_file accelerate_config_multi_gpu.yaml \
-  -m dual_kl.train_dualkl_new_2 \
-  --student_model Qwen/Qwen3-4B --teacher_model Qwen/Qwen3-32B \
-  --dataset deepmath --batch_size 4 --group_size 4 --grad_accum 4 \
-  --max_new_tokens 1024 --max_prompt_tokens 128 --use_lora --lora_r 64 --dtype bf16 \
-  --wandb_project dualkl-distill --wandb_name qwen4b_dualkl_mc-2-deepmath \
-  --teacher_ds_zero3 --gen_micro_batch 4 --lp_micro_batch 4 \
-  --output_dir ./out/dual-kl-mc-2-deepmath \
-  --no_progress
-
-# eval
-
-## base model
-torchrun --nproc_per_node 4 -m eval.run_eval \
- --task gsm8k --model Qwen/Qwen3-4B --dtype bf16 \
- --batch_size 8 --save_outputs ./eval_out
-
-## opd-4b-32b
-torchrun --nproc_per_node 4 -m eval.run_eval \
- --task gsm8k --model ./out/opd-4b-32b-deepmath/step-500 \
- --base_model Qwen/Qwen3-4B --dtype bf16 \
- --batch_size 8 --save_outputs ./eval_out
-
-## dual-kl-mc-2
-torchrun --nproc_per_node 4 -m eval.run_eval \
- --task gsm8k --model ./out/dual-kl-mc-2/step-1000 \
- --base_model Qwen/Qwen3-4B --dtype bf16 \
- --batch_size 8 --save_outputs ./eval_out
-
-torchrun --nproc_per_node 4 -m eval.run_eval \
- --task gsm8k --model ./out/dual-kl-mc-2-deepmath/step-500 \
- --base_model Qwen/Qwen3-4B --dtype bf16 \
- --batch_size 8 --save_outputs ./eval_out
-
-
-
-
-
-
-
-## opd和dkl的比较：选择deepmath作为训练集，最大token数为4096，最大prompt为256
-
-# baseline: on-policy distillation   / deepmath
-accelerate launch --config_file accelerate_config_multi_gpu.yaml \
-  -m on_policy_distill.train_on_policy_local \
-  --student_model Qwen/Qwen3-4B --teacher_model Qwen/Qwen3-32B \
-  --dataset deepmath --batch_size 4 --group_size 4 --grad_accum 2 \
-  --gen_micro_batch 1 --lp_micro_batch 1 --kl_coef 1.0 --kl_discount 0.0 \
-  --max_new_tokens 2048 --max_prompt_tokens 256 --use_lora --lora_r 64 --dtype bf16 \
-  --wandb_project dualkl-distill --wandb_name opd-4b-32b-deepmath \
-  --teacher_ds_zero3 --output_dir ./out/opd-4b-32b-deepmath-long \
-  --no_progress
-# dual-kl / deepmath
-accelerate launch --config_file accelerate_config_multi_gpu.yaml \
-  -m dual_kl.train_dualkl_new_2 \
-  --student_model Qwen/Qwen3-4B --teacher_model Qwen/Qwen3-32B \
-  --dataset deepmath --batch_size 4 --group_size 4 --grad_accum 2 \
-  --max_new_tokens 2048 --max_prompt_tokens 256 --use_lora --lora_r 64 --dtype bf16 \
-  --wandb_project dualkl-distill --wandb_name dkl-4b-32b-deepmath \
-  --teacher_ds_zero3 --gen_micro_batch 1 --lp_micro_batch 1 \
-  --output_dir ./out/dkl-4b-32b-deepmath-long \
-  --no_progress
+# RL-Style On-Policy Distillation with Early-Decayed Forward KL
 
+本文档说明当前 `on_policy_distill/train_on_policy_rl_local.py` 这条方法线的完整逻辑。
 
+我们的实验已经表明，在数学推理蒸馏任务上：
 
-evalscope eval --eval-type llm_ckpt \
- --model ~/.cache/huggingface/hub/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c \
- --model-args "hub='huggingface', precision='auto'" \
- --datasets gsm8k --limit 5
+1. 纯 `rKL` 的 on-policy distillation 更有利于得到尖锐、低熵、模式更集中的学生分布；
+2. 这种 mode-seeking 特性更适合数学任务中“找到一条确定而稳定的正确推理路径”；
+3. 但在训练初期，学生与教师分布差异过大时，单纯 `rKL` 容易让学生在错误区域内自我强化，从而训练不稳定，甚至进入局部最优；
+4. 因此更合理的策略不是始终保留 `fKL`，而是在训练初期利用 `fKL` 把学生快速拉到教师分布附近，随后逐步去掉 `fKL`，回归纯 `rKL` 的标准 OPD。
 
-python -m evalscope.run --eval-type llm_ckpt \
-        --model "~/.cache/huggingface/hub/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c" \
-        --model-args "hub='huggingface', precision='auto'" \
-        --datasets gsm8k --limit 5
+基于这个假设，我们提出当前的训练方案：
 
-evalscope eval --eval-type llm_ckpt \
-        --model ~/.cache/huggingface/hub/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c \
-        --model-args "hub='huggingface', lora_path='/hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/opd-4b-32b-deepmath-long/step-500',
-  precision='auto'" \
-        --datasets gsm8k --limit 5
+- 训练初期：`rKL + fKL`
+- 训练中期：`fKL` 线性衰减
+- 训练后期：只保留 `rKL`
 
-python -m evalscope.run --eval-type llm_ckpt \
-        --model ~/.cache/huggingface/hub/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c \
-        --model-args "hub='huggingface', lora_path='~/Documents/Dual-KL-Distillation/out/opd-4b-32b-deepmath-long/step-500',
-  precision='auto'" \
-        --datasets gsm8k --limit 5
+这可以看成一种“前期 distribution locating，后期 mode seeking”的蒸馏策略。
 
+## 1. 问题背景
 
+标准 on-policy distillation（OPD）的核心思想是：
 
+- 学生先按自己的当前策略生成轨迹；
+- 教师只对学生实际生成到的 token 给出逐 token 的密集监督；
+- 用学生路径上的 `reverse KL` 更新学生，而不是像传统 KD 那样始终让学生直接拟合教师分布。
 
-# dual-kl / deepmath / qwen3 1.7B
-accelerate launch --config_file accelerate_config_multi_gpu.yaml \
-  -m dual_kl.train_dualkl_new_2 \
-  --student_model Qwen/Qwen3-1.7B --teacher_model Qwen/Qwen3-32B \
-  --dataset deepmath --batch_size 4 --group_size 4 --grad_accum 2 \
-  --max_new_tokens 2048 --max_prompt_tokens 256 --use_lora --lora_r 64 --dtype bf16 \
-  --wandb_project dualkl-distill --wandb_name dkl-1.7b-32b-deepmath \
-  --teacher_ds_zero3 --gen_micro_batch 2 --lp_micro_batch 2 \
-  --output_dir ./out/dkl-1.7b-32b-deepmath-long \
-  --no_progress
+设：
 
-accelerate launch --config_file accelerate_config_multi_gpu.yaml \
-  -m on_policy_distill.train_on_policy_local \
-  --student_model Qwen/Qwen3-1.7B --teacher_model Qwen/Qwen3-32B \
-  --dataset deepmath --batch_size 4 --group_size 4 --grad_accum 2 \
-  --gen_micro_batch 2 --lp_micro_batch 2 --kl_coef 1.0 --kl_discount 0.0 \
-  --max_new_tokens 2048 --max_prompt_tokens 256 --use_lora --lora_r 64 --dtype bf16 \
-  --wandb_project dualkl-distill --wandb_name opd-1.7b-32b-deepmath \
-  --teacher_ds_zero3 --output_dir ./out/opd-1.7b-32b-deepmath-long \
-  --no_progress
+- 学生旧策略为 `\pi_old`
+- 当前训练中的学生策略为 `\pi_\theta`
+- 教师策略为 `q`
+- 输入 prompt 为 `x`
+- 学生生成响应为 `y = (y_1, y_2, ..., y_T)`
 
+则标准 OPD 使用的是学生路径上的 `reverse KL` 信号：
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3-1.7B --tensor-parallel-size 4 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+\[
+\Delta_t^{(r)} = \log \pi_{\text{old}}(y_t \mid x, y_{<t}) - \log q(y_t \mid x, y_{<t})
+\]
 
-evalscope eval --model Qwen/Qwen3-1.7B --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 5 --dataset-args "$(cat dataset_args.json)"
+它的直观意义是：
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3-1.7B --enable-lora --lora-modules 1.7b-opd500-8192=/hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/opd-1.7b-32b-deepmath-long/step-500 --max-lora-rank 64 --tensor-parallel-size 4 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+- 如果学生在自己采到的 token 上比教师更自信，则 `\Delta_t^{(r)} > 0`
+- 这说明学生可能在错误模式上过度集中
+- 那么更新应压低这类 token 的概率
 
-evalscope eval --model 1.7b-opd500-8192 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 5 --dataset-args "$(cat dataset_args.json)"
+这类训练天然带有 mode-seeking 倾向，因此在数学任务中，常常比持续保留更“覆盖式”的 `fKL` 更有利。
 
+## 2. 为什么不能始终保留 fKL
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3-1.7B --enable-lora --lora-modules 1.7b-dkl500-8192=/hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath-long/step-500 --max-lora-rank 64 --tensor-parallel-size 4 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+`forward KL` 的优势在于：
 
-evalscope eval --model 1.7b-dkl500-8192 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 5 --dataset-args "$(cat dataset_args.json)"
+- 它能把学生快速拉向教师分布的支持集；
+- 当学生还很弱、分布还很散时，这很重要。
 
+但如果整个训练过程都持续保留强 `fKL`，就会带来两个问题：
 
+1. 学生会持续被迫覆盖教师的更宽分布，而不是收缩到最有用的窄分布。
+2. 对数学推理这类“正确路径通常很尖锐”的任务，持续的 `fKL` 可能抑制学生在后期形成低熵、确定性的正确推理模式。
 
-# train new-3  该版本去除归一化权重
-accelerate launch --config_file accelerate_config_multi_gpu.yaml \
-  -m dual_kl.train_dualkl_new_3 \
-  --student_model Qwen/Qwen3-1.7B --teacher_model Qwen/Qwen3-32B \
-  --dataset deepmath --batch_size 4 --group_size 4 --grad_accum 2 \
-  --max_new_tokens 2048 --max_prompt_tokens 256 --use_lora --lora_r 64 --dtype bf16 \
-  --wandb_project dualkl-distill --wandb_name dkl-1.7b-32b-deepmath-lamr1f0.5 \
-  --teacher_ds_zero3 --gen_micro_batch 2 --lp_micro_batch 2 \
-  --output_dir ./out/dkl-1.7b-32b-deepmath-lamr1f0.5 \
-  --lam_r 1 --lam_f 0.5 \
-  --no_progress
+因此，“始终 `rKL + fKL`”并不是数学蒸馏任务上的最优方案。更合理的方案是：
 
-accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
-  -m dual_kl.train_dualkl_new_3 \
-  --student_model Qwen/Qwen3-1.7B --teacher_model Qwen/Qwen3-32B \
-  --dataset deepmath --batch_size 8 --group_size 4 --grad_accum 1 \
-  --max_new_tokens 2048 --max_prompt_tokens 256 --use_lora --lora_r 64 --dtype bf16 \
-  --wandb_project dualkl-distill --wandb_name dkl-1.7b-32b-deepmath-lamr0f1 \
-  --teacher_ds_zero3 --gen_micro_batch 2 --lp_micro_batch 2 \
-  --output_dir ./out/dkl-1.7b-32b-deepmath-lamr0f1 \
-  --lam_r 0 --lam_f 1
+- 初期利用 `fKL` 稳定训练；
+- 后期让 `rKL` 独占训练目标。
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3-1.7B --enable-lora --lora-modules 1.7b-dkl500-8192-lamr1f0.5=/hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath-lamr1f0.5/step-500 --max-lora-rank 64 --tensor-parallel-size 4 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+## 3. 方法概述
 
-evalscope eval --model 1.7b-dkl500-8192-lamr1f0.5 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 5 --dataset-args "$(cat dataset_args.json)"
+我们的方法由三部分组成：
 
+1. `rKL` 主分支
+   使用 RL / PPO 风格的 on-policy 训练框架，在学生 rollout 上构造 token-level advantage。
 
-evalscope eval --model 1.7b-dkl500-8192-lamr1f0.5 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets truthful_qa
+2. `fKL` 辅助分支
+   在相同上下文下，从教师分布逐位置采样 token，并在这些 token 上给学生增加额外的 NLL 约束。
 
-evalscope eval --model 1.7b-opd500-8192 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets truthful_qa
+3. `fKL` 线性衰减调度
+   初始时 `fKL` 权重较大，随后在训练前一段时间内线性减小到 0；在权重归零后，不再计算 `fKL` 对应的教师采样分支。
 
-evalscope eval --model Qwen/Qwen3-1.7B --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets truthful_qa
+## 4. 训练流程
 
+每个训练 step 的流程如下：
 
-bash run_compute_kl.sh 2>&1 | tee run_log.txt
+1. 从数据集中取一批 prompt。
+2. 学生按当前策略 `\pi_old` 采样生成若干条回答。
+3. 在这些学生轨迹上，计算：
+   - 学生旧 logprob
+   - 教师 logprob
+4. 构造 `rKL` 的 token-level advantage。
+5. 如果当前 step 的 `fKL` 权重仍大于 0：
+   - 从教师分布逐位置采样 token；
+   - 在这些 token 上计算学生的 NLL 辅助损失。
+6. 用 PPO 或 importance sampling 目标更新学生。
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3-1.7B --enable-lora --lora-modules 1.7b-dkl500-8192-lamr1f0.2=/hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath-lamr1f0.2/step-500 --max-lora-rank 64 --tensor-parallel-size 4 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+因此，整个训练是一个标准 RL-style OPD 框架，只是额外挂接了一个可衰减的 `fKL` 辅助分支。
 
-evalscope eval --model 1.7b-dkl500-8192-lamr1f0.2 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 5 --dataset-args "$(cat dataset_args.json)"
+## 5. 公式
 
-torchrun --nproc_per_node=8 compute_dual_kl_qwen.py --teacher_model Qwen/Qwen3-32B --student_model Qwen/Qwen3-1.7B \
-  --dataset aime24 --aime_split train --max_samples 30 --max_new_tokens 2048 --dtype bf16 --ddp \
-  --output_json output-computekl-dkl/dual_kl_metrics.json --plot_dir output-computekl-dkl/entropy_plots \
-  --do_sample --temperature 0.7 --top_p 0.95 \
-  --student_lora /hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath-long/step-500
+### 5.1 学生路径上的 reverse KL
 
-torchrun --nproc_per_node=8 compute_dual_kl_qwen.py --teacher_model Qwen/Qwen3-32B --student_model Qwen/Qwen3-1.7B \
-  --dataset aime24 --aime_split train --max_samples 30 --max_new_tokens 2048 --dtype bf16 --ddp \
-  --output_json output-computekl-dklr0f1/dual_kl_metrics.json --plot_dir output-computekl-dklr0f1/entropy_plots \
-  --do_sample --temperature 0.7 --top_p 0.95 \
-  --student_lora /hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath-lamr0f1/step-500
+学生先生成：
 
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 vllm serve Qwen/Qwen3-1.7B --enable-lora --lora-modules 1.7b-dkl500-8192-lamr0f1=/hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath-lamr0f1/step-500 --max-lora-rank 64 --tensor-parallel-size 8 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+\[
+y \sim \pi_{\text{old}}(\cdot \mid x)
+\]
 
-evalscope eval --model 1.7b-dkl500-8192-lamr0f1 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 5 --dataset-args "$(cat dataset_args.json)"
+对每个位置 `t`，定义学生路径上的 `reverse KL` Monte Carlo 差值：
 
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 vllm serve Qwen/Qwen3-1.7B --enable-lora --lora-modules 1.7b-dkl1000-8192-lamr1f0.2=/hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath-lamr1f0.2/step-1000 --max-lora-rank 64 --tensor-parallel-size 8 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+\[
+\Delta_t^{(r)} =
+\log \pi_{\text{old}}(y_t \mid x, y_{<t})
+- \log q(y_t \mid x, y_{<t})
+\]
 
-evalscope eval --model 1.7b-dkl1000-8192-lamr1f0.2 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 5 --dataset-args "$(cat dataset_args.json)"
+## 5.2 rKL advantage
 
-# new-4   修改fkl优势裁剪，增加位置衰减参数[--fkl_pos_decay]
+我们将其转成 RL 里的 token-level advantage：
 
-accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
-  -m dual_kl.train_dualkl_new_4 \
-  --student_model Qwen/Qwen3-1.7B --teacher_model Qwen/Qwen3-32B \
-  --dataset deepmath --batch_size 8 --group_size 4 --grad_accum 1 \
-  --max_new_tokens 2048 --max_prompt_tokens 256 --use_lora --lora_r 64 --dtype bf16 \
-  --wandb_project dualkl-distill --wandb_name dkl-1.7b-32b-deepmath-lamr1f1-noposdecay \
-  --teacher_ds_zero3 --gen_micro_batch 2 --lp_micro_batch 2 \
-  --output_dir ./out/dkl-1.7b-32b-deepmath-lamr1f1-noposdecay \
-  --lam_r 1 --lam_f 1 \
-  --no_progress
+\[
+A_t^{(r)} = -\lambda_{\text{coef}} \, \Delta_t^{(r)}
+\]
 
-accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
-  -m dual_kl.train_dualkl_new_4 \
-  --student_model Qwen/Qwen3-1.7B --teacher_model Qwen/Qwen3-32B \
-  --dataset deepmath --batch_size 8 --group_size 4 --grad_accum 1 \
-  --max_new_tokens 2048 --max_prompt_tokens 256 --use_lora --lora_r 64 --dtype bf16 \
-  --wandb_project dualkl-distill --wandb_name dkl-1.7b-32b-deepmath-lamr1f1-posdecay \
-  --teacher_ds_zero3 --gen_micro_batch 2 --lp_micro_batch 2 \
-  --output_dir ./out/dkl-1.7b-32b-deepmath-lamr1f1-posdecay \
-  --fkl_pos_decay \
-  --lam_r 1 --lam_f 1 \
-  --no_progress
+其中：
 
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 vllm serve Qwen/Qwen3-1.7B --enable-lora --lora-modules 1.7b-dkl200_8-8192-lamr1f1-posdecay=/hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath-lamr1f1-posdecay/step-200 --max-lora-rank 64 --tensor-parallel-size 8 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+- `\lambda_coef` 对应代码中的 `kl_coef`
+- 默认建议取 `1`
 
-evalscope eval --model 1.7b-dkl200_8-8192-lamr1f1-posdecay --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 5 --dataset-args "$(cat dataset_args.json)"
+如果开启未来折扣，则进一步构造：
 
-torchrun --nproc_per_node=8 compute_dual_kl_qwen2.py --teacher_model Qwen/Qwen3-32B --student_model Qwen/Qwen3-1.7B \
-  --dataset aime24 --aime_split train --max_samples 30 --max_new_tokens 2048 --dtype bf16 --ddp \
-  --output_json output-computekl-dklr1f1-posdecay/dual_kl_metrics.json --plot_dir output-computekl-dklr1f1-posdecay/entropy_plots \
-  --do_sample --temperature 0.7 --top_p 0.95 \
-  --student_lora /hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath-lamr1f1-posdecay/step-200
+\[
+\tilde A_t^{(r)} =
+\sum_{u=t}^{T}\gamma^{u-t} A_u^{(r)}
+\]
 
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 vllm serve Qwen/Qwen3-1.7B --enable-lora --lora-modules 1.7b-opd400-8192=/hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/opd-1.7b-32b-deepmath-long/step-400 --max-lora-rank 64 --tensor-parallel-size 8 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+其中 `\gamma` 对应 `kl_discount`。
 
-evalscope eval --model 1.7b-opd400-8192 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 5 --dataset-args "$(cat dataset_args.json)"
+在标准 baseline 里，我们建议：
 
-# baseline opd 0.6B 32B
+\[
+\lambda_{\text{coef}} = 1, \quad \gamma = 0
+\]
 
-accelerate launch --config_file accelerate_config_multi_4gpu.yaml \
-  -m on_policy_distill.train_on_policy_local \
-  --student_model Qwen/Qwen3-0.6B --teacher_model Qwen/Qwen3-32B \
-  --dataset deepmath --batch_size 4 --group_size 4 --grad_accum 2 \
-  --gen_micro_batch 2 --lp_micro_batch 2 --kl_coef 1.0 --kl_discount 0.0 \
-  --max_new_tokens 2048 --max_prompt_tokens 256 --use_lora --lora_r 64 --dtype bf16 \
-  --wandb_project dualkl-distill --wandb_name opd-0.6b-32b-deepmath \
-  --teacher_ds_zero3 --output_dir ./out/opd-0.6b-32b-deepmath \
-  --no_progress
+即不额外放大，也不做未来折扣。
 
-accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
-  -m dual_kl.train_dualkl_new_4 \
-  --student_model Qwen/Qwen3-0.6B --teacher_model Qwen/Qwen3-32B \
-  --dataset deepmath --batch_size 8 --group_size 4 --grad_accum 1 \
-  --max_new_tokens 2048 --max_prompt_tokens 256 --use_lora --lora_r 64 --dtype bf16 \
-  --wandb_project dualkl-distill --wandb_name dkl-0.6b-32b-deepmath-lamr1f1-posdecay \
-  --teacher_ds_zero3 --gen_micro_batch 2 --lp_micro_batch 2 \
-  --output_dir ./out/dkl-0.6b-32b-deepmath-lamr1f1-posdecay \
-  --fkl_pos_decay \
-  --lam_r 1 --lam_f 1 \
-  --no_progress
+### 5.3 PPO / IS 形式的 rKL 主分支
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3-0.6B --enable-lora --lora-modules 0.6b-dkl300_8-8192=/hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-0.6b-32b-deepmath-lamr1f1-posdecay/step-300 --max-lora-rank 64 --tensor-parallel-size 4 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+令：
 
-evalscope eval --model 0.6b-dkl300_8-8192 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 5 --dataset-args "$(cat dataset_args.json)"
+\[
+\rho_t(\theta) =
+\exp\Big(
+\log \pi_\theta(y_t \mid x, y_{<t})
+- \log \pi_{\text{old}}(y_t \mid x, y_{<t})
+\Big)
+\]
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3-0.6B --enable-lora --lora-modules 0.6b-opd500_4-8192=/hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/opd-0.6b-32b-deepmath/step-500 --max-lora-rank 64 --tensor-parallel-size 4 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+如果使用 PPO，则 rKL 主分支为：
 
-evalscope eval --model 0.6b-opd500_4-8192 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 5 --dataset-args "$(cat dataset_args.json)"
+\[
+L_t^{(r)}(\theta)
+=
+-\min\Big(
+\rho_t(\theta)\tilde A_t^{(r)},
+\text{clip}(\rho_t(\theta), 1-\epsilon_l, 1+\epsilon_h)\tilde A_t^{(r)}
+\Big)
+\]
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3-0.6B --tensor-parallel-size 4 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+如果使用 importance sampling，则为：
 
-evalscope eval --model Qwen/Qwen3-0.6B --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 5 --dataset-args "$(cat dataset_args.json)"
+\[
+L_t^{(r)}(\theta)
+=
+- \rho_t(\theta)\tilde A_t^{(r)}
+\]
 
-torchrun --nproc_per_node=8 compute_dual_kl_qwen2.py --teacher_model Qwen/Qwen3-32B --student_model Qwen/Qwen3-1.7B \
-  --dataset aime24 --aime_split train --max_samples 30 --max_new_tokens 2048 --dtype bf16 --ddp \
-  --output_json output-computekl-dklr1f1-posdecay-t0.1/dual_kl_metrics.json --plot_dir output-computekl-dklr1f1-posdecay-t0.1/entropy_plots \
-  --do_sample --temperature 0.1 --top_p 0.95 \
-  --student_lora /hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath-lamr1f1-posdecay/step-200
+再乘上 rKL 主分支的权重 `\lambda_r`：
 
-torchrun --nproc_per_node=8 compute_dual_kl_qwen2.py --teacher_model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B --student_model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
-  --dataset aime24 --aime_split train --max_samples 30 --max_new_tokens 2048 --dtype bf16 --ddp \
-  --output_json computekl-ds7B-1.5B/dual_kl_metrics.json --plot_dir computekl-ds7B-1.5B/entropy_plots \
-  --do_sample --temperature 0.7 --top_p 0.95 \
-  --student_lora /hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath-long/step-500
+\[
+L_{t,\text{weighted}}^{(r)} = \lambda_r L_t^{(r)}
+\]
 
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 vllm serve Qwen/Qwen3-1.7B --enable-lora --lora-modules 1.7b-dkl300_8-8192-lamr1f1-posdecay=/hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath-lamr1f1-posdecay/step-300 --max-lora-rank 64 --tensor-parallel-size 8 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+通常默认：
 
-evalscope eval --model 1.7b-dkl300_8-8192-lamr1f1-posdecay --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 5 --dataset-args "$(cat dataset_args.json)"
+\[
+\lambda_r = 1
+\]
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3-1.7B --enable-lora --lora-modules 1.7b-dkl100_8-8192-lamr1f1-posdecay=/hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath-lamr1f1-posdecay/step-100 --max-lora-rank 64 --tensor-parallel-size 4 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+### 5.4 教师路径采样的 fKL 辅助项
 
-evalscope eval --model 1.7b-dkl100_8-8192-lamr1f1-posdecay --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 5 --dataset-args "$(cat dataset_args.json)"
+当 `fKL` 开启时，我们在相同上下文 `(x, y_{<t})` 下，从教师分布采样：
 
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 vllm serve Qwen/Qwen3-1.7B --enable-lora --lora-modules 1.7b-dkl500_8-8192-lamr1f1-posdecay=/hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath-lamr1f1-posdecay/step-400 --max-lora-rank 64 --tensor-parallel-size 8 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+\[
+z_t \sim q(\cdot \mid x, y_{<t})
+\]
 
-evalscope eval --model 1.7b-dkl500_8-8192-lamr1f1-posdecay --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 5 --dataset-args "$(cat dataset_args.json)"
+并构造学生在教师采样 token 上的负对数似然：
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3-1.7B --enable-lora --lora-modules 1.7b-opd700_4-8192=/hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/opd-1.7b-32b-deepmath-long/step-700 --max-lora-rank 64 --tensor-parallel-size 4 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+\[
+L_t^{(f)}(\theta)
+=
+- \log \pi_\theta(z_t \mid x, y_{<t})
+\]
 
-evalscope eval --model 1.7b-opd700_4-8192 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 5 --dataset-args "$(cat dataset_args.json)"
+这项损失的作用不是让学生永远覆盖教师分布，而是在训练初期给学生提供“定位教师支持集”的能力。
 
-## 1.7b-dkl200_8-8192-lamr1f1-noposdecay
-CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3-1.7B --enable-lora --lora-modules 1.7b-dkl200_8-8192-lamr1f1-noposdecay=/hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath-lamr1f1-noposdecay/step-200 --max-lora-rank 64 --tensor-parallel-size 4 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+### 5.5 逐步衰减的 fKL 权重
 
-evalscope eval --model 1.7b-dkl300_8-8192-lamr1f1-noposdecay --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 3 --dataset-args "$(cat dataset_args.json)"
+令总训练步数为 `T`，当前步数为 `s`，设 `p` 为 `fKL` 衰减结束所占的训练进度比例，例如 `p = 0.3`。
 
+则我们定义：
 
+\[
+\lambda_f^{(s)} =
+\begin{cases}
+\lambda_f \left(1 - \frac{s/T}{p}\right), & s/T < p \\
+0, & s/T \ge p
+\end{cases}
+\]
 
+含义是：
 
+- 第 0 步时，`fKL` 权重为初始值 `\lambda_f`
+- 在训练前 `p` 比例的 step 中，线性下降
+- 当训练进度达到 `p` 后，`fKL` 权重变为 0
+- 之后训练完全退化为纯 `rKL` OPD
 
+这正是本方法最核心的设计。
 
+### 5.6 总损失
 
+最终每个位置的总损失写为：
 
+\[
+L_t(\theta)
+=
+\lambda_r L_t^{(r)}(\theta)
+ \lambda_f^{(s)} L_t^{(f)}(\theta)
+\]
 
+只在 continuation 且非 pad 的位置上累积：
 
+\[
+L(\theta)
+=
+\frac{1}{|\mathcal V|}
+\sum_{t \in \mathcal V} L_t(\theta)
+\]
 
+其中 `\mathcal V` 是有效 token 位置集合。
 
+## 6. 为什么这样做
 
+这套设计的逻辑可以概括为两句话：
 
+1. 前期先找对地方
+2. 后期再往正确模式上收缩
 
+更具体地说：
 
+### 6.1 前期需要 fKL
 
+训练前期，学生分布和教师分布往往差异很大。
 
+如果此时只使用 `rKL`：
 
+- 学生只会在自己已经采到的 token 上获得信号；
+- 如果学生一开始就走偏了，`rKL` 可能只能在错误模态附近继续局部修补；
+- 这样容易训练不稳定，也更容易进入局部最优。
 
-# sample数据量32k，训练1000step
+而 `fKL` 的作用是：
 
-python sample_deepmath.py --source zwhe99/DeepMath-103K --split train --num-samples 32000 --output-dir DeepMath-32k
+- 让学生看到教师更可能采到哪些 token；
+- 把学生快速拉回教师分布附近；
+- 起到 warm start 和稳定训练的作用。
 
-## baseline 方案 -- opd
-accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
-  -m on_policy_distill.train_on_policy_local \
-  --student_model Qwen/Qwen3-1.7B --teacher_model Qwen/Qwen3-32B \
-  --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 1 \
-  --gen_micro_batch 2 --lp_micro_batch 2 --kl_coef 1.0 --kl_discount 0.0 \
-  --max_new_tokens 2048 --max_prompt_tokens 256 --use_lora --lora_r 64 --dtype bf16 \
-  --wandb_project dualkl-distill --wandb_name opd-1.7b-32b-deepmath_sample32k \
-  --teacher_ds_zero3 --output_dir ./out/opd-1.7b-32b-deepmath_sample32k \
+### 6.2 后期不能继续依赖 fKL
 
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 vllm serve out/opd-1.7b-32b-deepmath_sample32k-step1000-merged --served-model-name 1.7b-opd1000_8-sample32k-8192 --tensor-parallel-size 8 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+一旦学生已经进入教师支持集附近，继续保留强 `fKL` 会带来副作用：
 
-evalscope eval --model 1.7b-opd1000_8-sample32k-8192 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 5 --dataset-args "$(cat dataset_args.json)"
+- 学生持续被迫维持更宽的分布；
+- 分布熵下降变慢；
+- 在数学任务中，不利于形成尖锐、稳定、确定的推理路径。
 
-## new-4 方案 -- posdecay 和noposdecay
-accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
-  -m dual_kl.train_dualkl_new_4 \
-  --student_model Qwen/Qwen3-1.7B --teacher_model Qwen/Qwen3-32B \
-  --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 1 \
-  --max_new_tokens 2048 --max_prompt_tokens 256 --use_lora --lora_r 64 --dtype bf16 \
-  --wandb_project dualkl-distill --wandb_name dkl-1.7b-32b-deepmath_sample32k-noposdecay \
-  --teacher_ds_zero3 --gen_micro_batch 2 --lp_micro_batch 2 \
-  --output_dir ./out/dkl-1.7b-32b-deepmath_sample32k-noposdecay \
-  --lam_r 1 --lam_f 1
+我们的实验结果表明，后期更合理的目标是：
 
-accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
-  -m dual_kl.train_dualkl_new_4 \
-  --student_model Qwen/Qwen3-1.7B --teacher_model Qwen/Qwen3-32B \
-  --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 1 \
-  --max_new_tokens 2048 --max_prompt_tokens 256 --use_lora --lora_r 64 --dtype bf16 \
-  --wandb_project dualkl-distill --wandb_name dkl-1.7b-32b-deepmath_sample32k-noposdecay \
-  --teacher_ds_zero3 --gen_micro_batch 2 --lp_micro_batch 2 --learning_rate 1e-6 \
-  --output_dir ./out/dkl-1.7b-32b-deepmath_sample32k-noposdecay \
-  --lam_r 1 --lam_f 1
+- 去掉 `fKL`
+- 仅保留 `rKL`
+- 让学生在正确区域内进一步 mode-seeking
 
-accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
-  -m dual_kl.train_dualkl_new_4 \
-  --student_model Qwen/Qwen3-1.7B --teacher_model Qwen/Qwen3-32B \
-  --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 1 \
-  --max_new_tokens 2048 --max_prompt_tokens 256 --use_lora --lora_r 64 --dtype bf16 \
-  --wandb_project dualkl-distill --wandb_name dkl-1.7b-32b-deepmath_sample32k-posdecay \
-  --teacher_ds_zero3 --gen_micro_batch 2 --lp_micro_batch 2 \
-  --output_dir ./out/dkl-1.7b-32b-deepmath_sample32k-posdecay \
-  --lam_r 1 --lam_f 1 --fkl_pos_decay
+这正是“early-decayed fKL”的核心动机。
 
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 vllm serve out/dkl-1.7b-32b-deepmath_sample32k-posdecay-step800-merged --served-model-name 1.7b-dkl800_8_posdecay-sample32k-8192 --tensor-parallel-size 8 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+## 7. 与其他方法的关系
 
-evalscope eval --model 1.7b-dkl800_8_posdecay-sample32k-8192 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 5 --dataset-args "$(cat dataset_args.json)"
+### 7.1 与标准 OPD 的关系
 
-## base 模型  Qwen3-32B
-CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3-32B --tensor-parallel-size 4 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+当：
 
-evalscope eval --model Qwen/Qwen3-32B --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 3 --dataset-args "$(cat dataset_args.json)"
+\[
+\lambda_r = 1,\quad \lambda_f = 0
+\]
 
-## base 模型  Qwen3-1.7B
-CUDA_VISIBLE_DEVICES=0,1 vllm serve Qwen/Qwen3-1.7B --tensor-parallel-size 2 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+时，本方法退化为标准的 RL-style OPD。
 
-evalscope eval --model Qwen/Qwen3-1.7B --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 3 --dataset-args "$(cat dataset_args.json)"
+### 7.2 与持续 dual-KL 的关系
 
-CUDA_VISIBLE_DEVICES=2,3 vllm serve Qwen/Qwen3-1.7B --tensor-parallel-size 2 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8802
+当：
 
-evalscope eval --model Qwen/Qwen3-1.7B --api-url http://127.0.0.1:8802/v1 --api-key EMPTY --eval-type openai_api --datasets math_500 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 3 --dataset-args "$(cat dataset_args.json)"
+\[
+\lambda_f^{(s)} = \lambda_f \quad \text{for all } s
+\]
 
-## eval 多个step的lora结果
+即 `fkl_decay_until = 0` 时，本方法退化为“始终保留 fKL”的 dual-KL 训练。
 
-CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3-1.7B --enable-lora --lora-modules 1.7b-opd800_8-sample32k-8192=out/opd-1.7b-32b-deepmath_sample32k/step-800 --max-lora-rank 64 --tensor-parallel-size 1 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+因此当前方法可以看成是下面两者之间的一种更细化、也更有效的插值：
 
-evalscope eval --model 1.7b-opd800_8-sample32k-8192 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 3 --dataset-args "$(cat dataset_args.json)"
+- 标准 OPD：只用 `rKL`
+- 持续 dual-KL：始终 `rKL + fKL`
 
-CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-1.7B --enable-lora --lora-modules 1.7b-opd600_8-sample32k-8192=out/opd-1.7b-32b-deepmath_sample32k/step-600 --max-lora-rank 64 --tensor-parallel-size 1 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8802
+而我们主张的是：
 
-evalscope eval --model 1.7b-opd600_8-sample32k-8192 --api-url http://127.0.0.1:8802/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 3 --dataset-args "$(cat dataset_args.json)"
+- 只在前期使用 `fKL`
+- 后期回归纯 `rKL`
 
-CUDA_VISIBLE_DEVICES=2 vllm serve Qwen/Qwen3-1.7B --enable-lora --lora-modules 1.7b-opd400_8-sample32k-8192=out/opd-1.7b-32b-deepmath_sample32k/step-400 --max-lora-rank 64 --tensor-parallel-size 1 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8803
+## 8. 关键实验设计
 
-evalscope eval --model 1.7b-opd400_8-sample32k-8192 --api-url http://127.0.0.1:8803/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 3 --dataset-args "$(cat dataset_args.json)"
+当前推荐至少做以下对照：
 
-CUDA_VISIBLE_DEVICES=3 vllm serve Qwen/Qwen3-1.7B --enable-lora --lora-modules 1.7b-opd200_8-sample32k-8192=out/opd-1.7b-32b-deepmath_sample32k/step-200 --max-lora-rank 64 --tensor-parallel-size 1 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8804
+1. `standard_opd`
+   - 纯 `rKL`
+   - 作为标准 baseline
 
-evalscope eval --model 1.7b-opd200_8-sample32k-8192 --api-url http://127.0.0.1:8804/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 3 --dataset-args "$(cat dataset_args.json)"
+2. `dual_kl_equal`
+   - 初始 `fKL` 权重为 `1`
+   - 在前 `30%` 训练内衰减到 `0`
+   - 这是当前主方案
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3-1.7B --enable-lora --lora-modules 1.7b-dkl1000_8_posdecay-sample32k-8192=/hpc2hdd/home/ychu763/Documents/Dual-KL-Distillation/out/dkl-1.7b-32b-deepmath_sample32k-posdecay/step-1000 --max-lora-rank 64 --tensor-parallel-size 4 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
+3. `dual_kl_always_on`
+   - 初始 `fKL` 权重为 `1`
+   - 始终不衰减
+   - 用于验证“持续 fKL 是否反而不利于数学蒸馏”
 
-evalscope eval --model 1.7b-dkl1000_8_posdecay-sample32k-8192 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 3 --dataset-args "$(cat dataset_args.json)"
+4. `dual_kl_mild_f`
+   - 初始 `fKL` 权重较小
+   - 用于分析前期辅助强度的影响
 
-# 测输出长度 max 2048 4096
-Qwen3-32B  avg_len  1857.44  3297
-dkl-1.7b-32b-deepmath_sample32k-step400-merged  avg_len 2029  3390
-opd-1.7b-32b-deepmath_sample32k-step400-merged  avg_len 2091  4139
+5. `dual_kl_mid_f`
+   - 中等初始 `fKL`
+   - 用于观察从弱到强的趋势
 
+实验结果表明，应观察到：
 
+- `dual_kl_equal` 优于 `standard_opd`
+  原因：训练前期更稳定，更容易找到教师分布
 
-# teacher用8b跑实验
+- `dual_kl_equal` 优于 `dual_kl_always_on`
+  原因：后期去掉 `fKL` 后，学生可以更充分地在纯 `rKL` 下收缩到尖锐模式
 
-### opd
-accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
-  -m on_policy_distill.train_on_policy_local \
-  --student_model Qwen/Qwen3-1.7B-Base --teacher_model Qwen/Qwen3-8B \
-  --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 1 \
-  --gen_micro_batch 2 --lp_micro_batch 2 --kl_coef 1.0 --kl_discount 0.0 \
-  --max_new_tokens 2048 --max_prompt_tokens 512 --use_lora --lora_r 64 --dtype bf16 \
-  --wandb_project dualkl-distill --wandb_name opd-1.7b-8b-deepmath_32k \
-  --teacher_ds_zero3 --output_dir ./out/opd-1.7b-8b-deepmath_32k \
-  --use_chat_template
+## 9. 实现上的工程选择
 
-### dkl: relu-fkl + no posdecay
-accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
-  -m dual_kl.train_dualkl_new_4 \
-  --student_model Qwen/Qwen3-1.7B-Base --teacher_model Qwen/Qwen3-8B \
-  --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 1 \
-  --max_new_tokens 2048 --max_prompt_tokens 512 --use_lora --lora_r 64 --dtype bf16 \
-  --wandb_project dualkl-distill --wandb_name dkl-1.7b-8b-deepmath_32k-no_posdecay \
-  --teacher_ds_zero3 --gen_micro_batch 2 --lp_micro_batch 2 \
-  --output_dir ./out/dkl-1.7b-8b-deepmath_32k-no_posdecay \
-  --lam_r 1 --lam_f 1 --use_chat_template
+当前实现还采用了以下工程策略：
 
-### dkl: relu-fkl + posdecay
-accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
-  -m dual_kl.train_dualkl_new_4 \
-  --student_model Qwen/Qwen3-1.7B-Base --teacher_model Qwen/Qwen3-8B \
-  --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 1 \
-  --max_new_tokens 2048 --max_prompt_tokens 512 --use_lora --lora_r 64 --dtype bf16 \
-  --wandb_project dualkl-distill --wandb_name dkl-1.7b-8b-deepmath_32k-posdecay \
-  --teacher_ds_zero3 --gen_micro_batch 2 --lp_micro_batch 2 \
-  --output_dir ./out/dkl-1.7b-8b-deepmath_32k-posdecay \
-  --lam_r 1 --lam_f 1 --fkl_pos_decay \
-  --use_chat_template
+- 学生 rollout 先生成，再落到 CPU，降低 GPU 峰值
+- logprob 前向按 `lp_micro_batch` 分片
+- 教师模型支持 ZeRO-3 分片推理
+- `fKL` 权重一旦衰减到 0，直接跳过教师采样分支，不再浪费计算
+- 支持本地模型路径和本地数据集路径，适配无网训练环境
+- 支持 swanlab 的 `offline / online / disabled` 三种模式
 
-### dkl: no-relu-fkl + posdecay
-accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
-  -m dual_kl.train_dualkl_new_4-noclipfkl \
-  --student_model Qwen/Qwen3-1.7B-Base --teacher_model Qwen/Qwen3-8B \
-  --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 1 \
-  --max_new_tokens 2048 --max_prompt_tokens 512 --use_lora --lora_r 64 --dtype bf16 \
-  --wandb_project dualkl-distill --wandb_name dkl-1.7b-8b-deepmath_32k-noclipfkl-posdecay \
-  --teacher_ds_zero3 --gen_micro_batch 2 --lp_micro_batch 2 \
-  --output_dir ./out/dkl-1.7b-8b-deepmath_32k-noclipfkl-posdecay \
-  --lam_r 1 --lam_f 1 --fkl_pos_decay \
-  --use_chat_template
+## 10. 总结
 
+这项工作的核心不是简单地把 `fKL` 叠加到 OPD 上，而是提出了一个更符合数学蒸馏任务特性的训练策略：
 
+- 训练前期，用 `fKL` 找到教师分布；
+- 训练后期，用纯 `rKL` 收缩到更尖锐、更稳定的正确推理模式。
 
-### dkl: relu-fkl + no posdecay
-accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
-  -m dual_kl.train_dualkl_new_4 \
-  --student_model /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-1.7B-Base --teacher_model /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-8B \
-  --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 4 \
-  --max_new_tokens 1024 --max_prompt_tokens 512 --use_lora --lora_r 64 --dtype bf16 \
-  --teacher_ds_zero3 --gen_micro_batch 4 --lp_micro_batch 4 \
-  --output_dir ./out/dkl-1.7b-8b-deepmath_32k-no_posdecay \
-  --lam_r 1 --lam_f 1 --use_chat_template --learning_rate 1e-6
+实验已经表明，相比：
 
-### dkl: no-relu-fkl + no-posdecay
-accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
-  -m dual_kl.train_dualkl_new_4_nocilpfkl \
-  --student_model /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-1.7B-Base --teacher_model /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-8B \
-  --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 4 \
-  --max_new_tokens 1024 --max_prompt_tokens 512 --use_lora --lora_r 64 --dtype bf16 \
-  --teacher_ds_zero3 --gen_micro_batch 4 --lp_micro_batch 4 \
-  --output_dir ./out/dkl-1.7b-8b-deepmath_32k-noclipfkl-no_posdecay \
-  --lam_r 1 --lam_f 1  --use_chat_template --learning_rate 1e-6
+- 纯 `rKL`：本方法训练更稳定；
+- 持续 `rKL + fKL`：本方法后期更适合数学推理蒸馏。
 
-### dkl: no-relu-fkl + posdecay
-accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
-  -m dual_kl.train_dualkl_new_4_nocilpfkl \
-  --student_model /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-1.7B-Base --teacher_model /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-8B \
-  --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 4 \
-  --max_new_tokens 1024 --max_prompt_tokens 512 --use_lora --lora_r 64 --dtype bf16 \
-  --teacher_ds_zero3 --gen_micro_batch 4 --lp_micro_batch 4 \
-  --output_dir ./out/dkl-1.7b-8b-deepmath_32k-noclipfkl-posdecay \
-  --lam_r 1 --lam_f 1  --use_chat_template --learning_rate 1e-6 --fkl_pos_decay
+因此，本方法的本质可以概括为：
 
-
-
-CUDA_VISIBLE_DEVICES=0,1 vllm serve /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-1.7B-Base --served-model-name Qwen3-1.7B-Base --tensor-parallel-size 2 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
-
-evalscope eval --model Qwen3-1.7B-Base --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 3 --dataset-args "$(cat dataset_args.json)"
-
-
-accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
-  -m on_policy_distill.train_on_policy_local \
-  --student_model /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-1.7B-Base --teacher_model /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-8B \
-  --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 4 \
-  --gen_micro_batch 4 --lp_micro_batch 4 --kl_coef 1.0 --kl_discount 0.0 \
-  --max_new_tokens 1024 --max_prompt_tokens 512 --use_lora --lora_r 64 --dtype bf16 \
-  --swanlab_project dualkl-distill ----swanlab_name opd-1.7b-8b-deepmath_32k \
-  --teacher_ds_zero3 --output_dir ./out/opd-1.7b-8b-deepmath_32k \
-  --use_chat_template --learning_rate 5e-6
-
-accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
-  -m dual_kl.train_dualkl_new_4_swanlab \
-  --student_model /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-1.7B-Base --teacher_model /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-8B \
-  --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 4 \
-  --max_new_tokens 1024 --max_prompt_tokens 512 --use_lora --lora_r 64 --dtype bf16 \
-  --swanlab_project dualkl-distill --swanlab_name dkl-1.7b-8b-deepmath_32k-no_posdecay \
-  --teacher_ds_zero3 --gen_micro_batch 4 --lp_micro_batch 4 \
-  --output_dir ./out/dkl-1.7b-8b-deepmath_32k-no_posdecay \
-  --lam_r 1 --lam_f 1 --use_chat_template --learning_rate 5e-6
-
-
-
-# new-5 非截断 fkl， lam_r=1, lam_f=1， 整体 posdecay， swanlab版本
-## stu模型 qwen3-4b-base  teacher模型 qwen3-8b
-
-### dkl: no-relu-fkl + no-posdecay
-accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
-  -m dual_kl.train_dualkl_new_5 \
-  --student_model /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-4B-Base --teacher_model /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-8B \
-  --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 4 \
-  --max_new_tokens 1024 --max_prompt_tokens 512 --use_lora --lora_r 64 --dtype bf16 \
-  --swanlab_project dualkl-distill --swanlab_name dkl-4b-8b-deepmath_32k-no_posdecay \
-  --teacher_ds_zero3 --gen_micro_batch 4 --lp_micro_batch 4 \
-  --output_dir ./out/dkl-4b-8b-deepmath_32k-no_posdecay \
-  --lam_r 1 --lam_f 1 --use_chat_template --learning_rate 5e-6
-
-### opd
-accelerate launch --config_file accelerate_config_multi_8gpu.yaml \
-  -m on_policy_distill.train_on_policy_local_swanlab \
-  --student_model /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-4B-Base --teacher_model /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-8B \
-  --dataset data/DeepMath-32k --batch_size 32 --group_size 1 --grad_accum 4 \
-  --gen_micro_batch 4 --lp_micro_batch 4 --kl_coef 1.0 --kl_discount 0.0 \
-  --max_new_tokens 1024 --max_prompt_tokens 512 --use_lora --lora_r 64 --dtype bf16 \
-  --swanlab_project dualkl-distill --swanlab_name opd-4b-8b-deepmath_32k \
-  --teacher_ds_zero3 --output_dir ./out/opd-4b-8b-deepmath_32k \
-  --use_chat_template --learning_rate 5e-6
-
-
-CUDA_VISIBLE_DEVICES=0,1 \
-  vllm serve /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-4B-Base \
-  --enable-lora \
-  --lora-modules ${LORA_NAME[$port]}=${LORA_PATH[$port]} \
-  --max-lora-rank ${RANK} \
-  --tensor-parallel-size ${TP} \
-  --trust-remote-code \
-  --max-model-len ${MAX_LEN} \
-  --gpu-memory-utilization ${MEM_UTIL} \
-  --port ${port}"
-
-CUDA_VISIBLE_DEVICES=0,1 vllm serve /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-4B-Base --enable-lora --lora-modules 4b_8b-dkl200_8-sample32k-8192=/home/chuyuanlin.cyl/notebook/Dual-KL-Distillation/out/dkl-4b-8b-deepmath_32k-no_posdecay/step-200 --max-lora-rank 64 --tensor-parallel-size 2 --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
-
-CUDA_VISIBLE_DEVICES=2,3 vllm serve /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-4B-Base --enable-lora --lora-modules 4b_8b-dkl500_8-sample32k-8192=/home/chuyuanlin.cyl/notebook/Dual-KL-Distillation/out/dkl-4b-8b-deepmath_32k-no_posdecay/step-500 --max-lora-rank 64 --tensor-parallel-size 2 --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8802
-
-CUDA_VISIBLE_DEVICES=4,5 vllm serve /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-4B-Base --enable-lora --lora-modules 4b_8b-dkl800_8-sample32k-8192=/home/chuyuanlin.cyl/notebook/Dual-KL-Distillation/out/dkl-4b-8b-deepmath_32k-no_posdecay/step-800 --max-lora-rank 64 --tensor-parallel-size 2 --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8803
-
-CUDA_VISIBLE_DEVICES=6,7 vllm serve /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-4B-Base --enable-lora --lora-modules 4b_8b-dkl1000_8-sample32k-8192=/home/chuyuanlin.cyl/notebook/Dual-KL-Distillation/out/dkl-4b-8b-deepmath_32k-no_posdecay/step-1000 --max-lora-rank 64 --tensor-parallel-size 2 --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8804
-
-CUDA_VISIBLE_DEVICES=4,5,6,7 vllm serve /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-8B-Base --served-model-name Qwen3-8B-Base --tensor-parallel-size 4 --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8802
-
-evalscope eval --model Qwen3-8B-Base --api-url http://127.0.0.1:8802/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 3 --dataset-args "$(cat dataset_args.json)"
-
-CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-8B-Base --enable-lora --lora-modules 8b_base-sft-2000=/home/chuyuanlin.cyl/tinker-examples/distillation/sft-openthoughts3-local--home-chuyuanlin.cyl-notebook-models-Qwen-Qwen3-8B-Base-128rank-0.001lr-128batch-2026-01-18-22-08/step-2000 --max-lora-rank 128 --tensor-parallel-size 4 --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8801
-
-evalscope eval --model 8b_base-sft-2000 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 3 --dataset-args "$(cat dataset_args.json)"
-
-
-python merge_lora.py \
---base /home/chuyuanlin.cyl/notebook/models/Qwen/Qwen3-8B-Base \
---adapter /home/chuyuanlin.cyl/tinker-examples/distillation/sft-openthoughts3-local--home-chuyuanlin.cyl-notebook-models-Qwen-Qwen3-8B-Base-128rank-0.001lr-128batch-2026-01-18-22-08/step-2000 \
---out /home/chuyuanlin.cyl/tinker-examples/distillation/8b-sft-2000-merged \
---dtype bf16 --device_map auto --safe
-
-/home/chuyuanlin.cyl/tinker-examples/distillation/8b-sft-2000-merged
-
-CUDA_VISIBLE_DEVICES=4,5,6,7 vllm serve /home/chuyuanlin.cyl/tinker-examples/distillation/8b-sft-2000-merged --served-model-name 8b-sft-2000 --tensor-parallel-size 4 --trust-remote-code --max-model-len 10000 --gpu-memory-utilization 0.8 --port 8802
-
-evalscope eval --model 8b-sft-2000 --api-url http://127.0.0.1:8801/v1 --api-key EMPTY --eval-type openai_api --datasets aime24 --generation-config '{"do_sample":true,"temperature":0.7,"max_tokens":8192}' --repeats 3 --dataset-args "$(cat dataset_args.json)"
+> `fKL` 用来“找对地方”，`rKL` 用来“收得更准”。
