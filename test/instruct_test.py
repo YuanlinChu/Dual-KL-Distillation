@@ -1,8 +1,4 @@
-# test_teacher_thinking.py
-
-"""
-python teacher.py
-"""
+# python test/instruct_test.py
 
 from __future__ import annotations
 
