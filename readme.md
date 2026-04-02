@@ -35,9 +35,9 @@
 
 则标准 OPD 使用的是学生路径上的 `reverse KL` 信号：
 
-\[
+$$
 \Delta_t^{(r)} = \log \pi_{\text{old}}(y_t \mid x, y_{<t}) - \log q(y_t \mid x, y_{<t})
-\]
+$$
 
 它的直观意义是：
 
