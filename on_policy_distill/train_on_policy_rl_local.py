@@ -57,7 +57,7 @@ class Config:
     batch_size: int = 256
     group_size: int = 4
     max_new_tokens: int = 512
-    temperature: float = 0.8
+    temperature: float = 1
     top_p: float = 0.95
     learning_rate: float = 5e-5
     weight_decay: float = 0.0
@@ -345,10 +345,18 @@ def build_continuation_mask(seqs_cpu: torch.Tensor, prompt_lengths: List[int], p
     return cont & attn[:, 1:]
 
 
-def gather_action_logprobs(logits: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
-    logp = nn.functional.log_softmax(logits, dim=-1)
-    return logp[:, :-1, :].gather(-1, input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)
+def _gather_logprobs(logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
+    """Compute log P(token_ids) from logits without materializing full log_softmax.
 
+    Uses ``logits.gather() - logsumexp(logits)`` so that only a [B, T, 1]
+    intermediate is created instead of [B, T, V].
+    """
+    gathered = logits[:, :-1, :].gather(-1, token_ids[:, 1:].unsqueeze(-1)).squeeze(-1)
+    lse = torch.logsumexp(logits[:, :-1, :], dim=-1)
+    return gathered - lse
+
+def gather_action_logprobs(logits: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+    return _gather_logprobs(logits, input_ids)
 
 def compute_rollout_logprobs(
     student: PreTrainedModel,
@@ -369,42 +377,60 @@ def compute_rollout_logprobs(
             sl = slice(i, i + max(1, lp_micro_batch))
             ids_mb = seqs_cpu[sl].to(accelerator.device, non_blocking=True)
             attn_mb = ids_mb.ne(pad_id).long()
+
+            # --- student forward ---
             with accelerator.autocast():
                 logits_s = student(input_ids=ids_mb, attention_mask=attn_mb, use_cache=False).logits
+                student_logprobs = _gather_logprobs(logits_s, ids_mb).float().cpu()
+            # keep logits_s only when fkl sampling needs it later
+            if not compute_fkl_samples:
+                del logits_s
+
+            # --- teacher forward ---
+            with accelerator.autocast():
                 logits_t = teacher(input_ids=ids_mb, attention_mask=attn_mb, use_cache=False).logits
-                logp_s = nn.functional.log_softmax(logits_s, dim=-1)
-                logp_t = nn.functional.log_softmax(logits_t, dim=-1)
-                old_chunks.append(logp_s[:, :-1, :].gather(-1, ids_mb[:, 1:].unsqueeze(-1)).squeeze(-1).float().cpu())
-                teacher_chunks.append(logp_t[:, :-1, :].gather(-1, ids_mb[:, 1:].unsqueeze(-1)).squeeze(-1).float().cpu())
-                if compute_fkl_samples:
-                    probs_t = logp_t[:, :-1, :].exp()
+                teacher_logprobs = _gather_logprobs(logits_t, ids_mb).float().cpu()
+
+            old_chunks.append(student_logprobs)
+            teacher_chunks.append(teacher_logprobs)
+
+            if compute_fkl_samples:
+                # fKL needs full teacher distribution for multinomial sampling
+                with accelerator.autocast():
+                    logp_t = nn.functional.log_softmax(logits_t[:, :-1, :], dim=-1)
+                    probs_t = logp_t.exp()
                     bsz, seq_len, vocab = probs_t.shape
                     sampled = torch.multinomial(probs_t.reshape(-1, vocab), num_samples=1).reshape(bsz, seq_len)
+                    del probs_t
                     sampled_token_chunks.append(sampled.cpu())
-                    sampled_student_chunks.append(
-                        logp_s[:, :-1, :].gather(-1, sampled.unsqueeze(-1)).squeeze(-1).float().cpu()
-                    )
                     sampled_teacher_chunks.append(
-                        logp_t[:, :-1, :].gather(-1, sampled.unsqueeze(-1)).squeeze(-1).float().cpu()
+                        logp_t.gather(-1, sampled.unsqueeze(-1)).squeeze(-1).float().cpu()
                     )
-            del ids_mb, attn_mb, logits_s, logits_t
-    old_all = torch.cat(old_chunks, dim=0)
-    teacher_all = torch.cat(teacher_chunks, dim=0)
-    if compute_fkl_samples:
+                    del logp_t
+                    # student: only gather the sampled positions (no full log_softmax)
+                    sampled_s_logits = logits_s[:, :-1, :].gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
+                    sampled_s_lse = torch.logsumexp(logits_s[:, :-1, :], dim=-1)
+                    sampled_student_chunks.append(
+                        (sampled_s_logits - sampled_s_lse).float().cpu()
+                    )
+                del logits_s
+
+            del ids_mb, attn_mb, logits_t
+
+    old_logprobs = torch.cat(old_chunks, dim=0) if old_chunks else torch.zeros(seqs_cpu.size(0), max(seqs_cpu.size(1) - 1, 0))
+    teacher_logprobs = torch.cat(teacher_chunks, dim=0) if teacher_chunks else torch.zeros_like(old_logprobs)
+
+    if compute_fkl_samples and sampled_token_chunks:
         sampled_tokens = torch.cat(sampled_token_chunks, dim=0)
-        sampled_student = torch.cat(sampled_student_chunks, dim=0)
-        sampled_teacher = torch.cat(sampled_teacher_chunks, dim=0)
+        sampled_student_logprobs = torch.cat(sampled_student_chunks, dim=0)
+        sampled_teacher_logprobs = torch.cat(sampled_teacher_chunks, dim=0)
     else:
-        sampled_tokens = torch.zeros_like(old_all, dtype=torch.long)
-        sampled_student = torch.zeros_like(old_all)
-        sampled_teacher = torch.zeros_like(old_all)
-    return (
-        old_all,
-        teacher_all,
-        sampled_tokens,
-        sampled_student,
-        sampled_teacher,
-    )
+        seq_len = max(seqs_cpu.size(1) - 1, 0)
+        sampled_tokens = torch.zeros(seqs_cpu.size(0), seq_len, dtype=torch.long)
+        sampled_student_logprobs = torch.zeros(seqs_cpu.size(0), seq_len)
+        sampled_teacher_logprobs = torch.zeros(seqs_cpu.size(0), seq_len)
+
+    return old_logprobs, teacher_logprobs, sampled_tokens, sampled_student_logprobs, sampled_teacher_logprobs            
 
 
 def build_zero_centered_group_rewards(num_rollouts: int, group_size: int) -> torch.Tensor:
@@ -551,8 +577,11 @@ def rl_update_substep(
 
         with accelerator.autocast():
             logits_s = student(input_ids=ids_mb, attention_mask=attn_mb, use_cache=False).logits
-            logp_all = nn.functional.log_softmax(logits_s, dim=-1)
-            cur_lp_mb = logp_all[:, :-1, :].gather(-1, ids_mb[:, 1:].unsqueeze(-1)).squeeze(-1)
+            logits_shift = logits_s[:, :-1, :]
+            lse = torch.logsumexp(logits_shift, dim=-1)
+
+            # PPO ratio: only gather the action token logprobs, no full log_softmax
+            cur_lp_mb = logits_shift.gather(-1, ids_mb[:, 1:].unsqueeze(-1)).squeeze(-1) - lse
             ratio = torch.exp(cur_lp_mb - old_lp_mb)
             if cfg.loss_fn == "ppo":
                 clip_low = 1.0 - cfg.ppo_clip_low
@@ -567,14 +596,22 @@ def rl_update_substep(
             else:
                 raise ValueError(f"unsupported loss_fn: {cfg.loss_fn}")
 
-            probs = logp_all[:, :-1, :].exp()
-            entropy_pos = -(probs * logp_all[:, :-1, :]).sum(dim=-1)
+            # Entropy: compute without materializing full probs tensor
+            # H = logsumexp - (sum(p * logit) / sum(p)) = logsumexp - E[logit]
+            # = logsumexp(logits) - sum(softmax(logits) * logits)
+            # Use: H = log(sum(exp(logits))) - sum(exp(logits - lse) * logits) / 1
+            with torch.no_grad():
+                softmax_shift = torch.softmax(logits_shift, dim=-1)
+                entropy_pos = lse - (softmax_shift * logits_shift).sum(dim=-1)
+                del softmax_shift
+
             total_loss_pos = cfg.lam_r * loss_pos
             fkl_loss_pos = torch.zeros_like(total_loss_pos)
             if use_fkl and teacher_tokens_mb is not None:
-                cur_teacher_lp = logp_all[:, :-1, :].gather(-1, teacher_tokens_mb.unsqueeze(-1)).squeeze(-1)
+                cur_teacher_lp = logits_shift.gather(-1, teacher_tokens_mb.unsqueeze(-1)).squeeze(-1) - lse
                 fkl_loss_pos = -cur_teacher_lp
                 total_loss_pos = total_loss_pos + rollout.fkl_weight * fkl_loss_pos
+            del logits_shift, lse
             loss_mb = total_loss_pos.masked_select(valid_mb).sum() / float(max(1, total_valid_tokens))
 
         is_last = (i + mb) >= rollout.input_ids_cpu.size(0)
@@ -593,7 +630,7 @@ def rl_update_substep(
         token_sum = token_sum + valid_mb.sum().detach()
         loss_sum = loss_sum + loss_mb.detach()
 
-        del ids_mb, attn_mb, valid_mb, old_lp_mb, adv_mb, logits_s, logp_all, cur_lp_mb, ratio, loss_pos, clip_frac, probs, entropy_pos, loss_mb, total_loss_pos, fkl_loss_pos, teacher_tokens_mb
+        del ids_mb, attn_mb, valid_mb, old_lp_mb, adv_mb, logits_s, cur_lp_mb, ratio, loss_pos, clip_frac, entropy_pos, loss_mb, total_loss_pos, fkl_loss_pos, teacher_tokens_mb
 
     grad_norm = accelerator.clip_grad_norm_(student.parameters(), max_norm=cfg.max_grad_norm)
     optimizer.step()
@@ -668,11 +705,14 @@ def evaluate_exact_kl(
             valid_mb = valid_mask[sl].to(accelerator.device)
             with accelerator.autocast():
                 logits_s = student(input_ids=ids_mb, attention_mask=am_mb, use_cache=False).logits
-                logits_t = teacher(input_ids=ids_mb, attention_mask=am_mb, use_cache=False).logits
                 logp_s = nn.functional.log_softmax(logits_s, dim=-1)
+                del logits_s
+                logits_t = teacher(input_ids=ids_mb, attention_mask=am_mb, use_cache=False).logits
                 logp_t = nn.functional.log_softmax(logits_t, dim=-1)
+                del logits_t
             r_pos = per_position_exact_kl(logp_s, logp_t, kind="rkl")
             f_pos = per_position_exact_kl(logp_s, logp_t, kind="fkl")
+            del logp_s, logp_t
             r_sum = r_sum + r_pos.masked_select(valid_mb).sum()
             f_sum = f_sum + f_pos.masked_select(valid_mb).sum()
             t_sum = t_sum + valid_mb.sum()
@@ -923,7 +963,7 @@ def parse_args() -> Config:
     p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--group_size", type=int, default=4)
     p.add_argument("--max_new_tokens", type=int, default=512)
-    p.add_argument("--temperature", type=float, default=0.8)
+    p.add_argument("--temperature", type=float, default=1)
     p.add_argument("--top_p", type=float, default=0.95)
     p.add_argument("--learning_rate", type=float, default=5e-5)
     p.add_argument("--weight_decay", type=float, default=0.0)

@@ -16,7 +16,7 @@
 base:
   # 学生模型
   # 这里应填写本地模型目录路径；云端无网环境下请使用 modelscope 下载后的本地目录
-  student_model: "/data/oss_bucket_0/zhulin/models/Qwen3-1.7B-Base"
+  student_model: "/data/oss_bucket_0/zhulin/output/Qwen3-1.7B-Base-sft-checkpoint-79"
   # 教师模型
   teacher_model: "/data/oss_bucket_0/zhulin/models/Qwen3-8B"
   # 默认输出目录；建议每个实验在具名实验里覆盖
@@ -29,14 +29,14 @@ base:
   system_prompt: "Please reason step by step, and put your final answer within \\boxed{}."
 
   # 训练步数与 batch
-  steps: 400
+  steps: 100
   batch_size: 256
-  group_size: 4
+  group_size: 1
   # 同一批 rollout 上重复优化的子步数，PPO/GRPO 风格参数
   num_substeps: 1
 
   # 采样配置
-  max_new_tokens: 1024
+  max_new_tokens: 4096
   max_prompt_tokens: 1024
   temperature: 1.0
   top_p: 1.0
@@ -50,20 +50,20 @@ base:
 
   # 模型/显存配置
   dtype: "bf16"
-  use_lora: true
+  use_lora: false
   lora_r: 32
   lora_alpha: 32
   lora_dropout: 0.0
 
   # 教师模型分片与微批
   teacher_ds_zero3: true
-  gen_micro_batch: 4
+  gen_micro_batch: 32
   lp_micro_batch: 2
   max_grad_norm: 1.0
 
   # 评估与保存
-  eval_every: 25
-  save_every: 25
+  eval_every: 10
+  save_every: 10
   seed: 42
 
   # swanlab 日志配置：
