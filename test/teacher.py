@@ -10,7 +10,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from typing import List
 
-def load_prompts_from_dataset(dataset_path: str, max_samples: int = 3) -> List[str]:
+def load_prompts_from_dataset(dataset_path: str, max_samples: int = 5) -> List[str]:
     """从数据集加载指定数量的问题"""
     try:
         from datasets import load_from_disk
@@ -69,7 +69,7 @@ def main():
     # teacher_model_path = "/data/oss_bucket_0/zhiyi.lx/output/ScaleAligner/output/output_sft-pipeline-ori-Qwen3-4B-Base/sft_train_ori-0/checkpoint-2999/hf"  # 修改为你的教师模型路径
     # teacher_model_path = "/data/oss_bucket_0/zhulin/output/sft-pipeline-ori-Qwen3-8B-Base-3000_hf"  # 修改为你的教师模型路径
     # teacher_model_path = "/data/oss_bucket_0/zhulin/models/Qwen3-8B"
-    teacher_model_path = "/data/oss_bucket_0/zhulin/output/Qwen3-4B-Base-sft-checkpoint-201"
+    teacher_model_path = "/data/oss_bucket_0/zhulin/output/Qwen3-1.7B-Base-sft-checkpoint-79"
     dataset_path = "/home/chuyuanlin.cyl/notebook/Dual-KL-Distillation/data/DeepMath-32k"  # 修改为你的数据集路径
     system_prompt = "Please reason step by step, and put your final answer within \\boxed{{}}."
     
@@ -95,7 +95,7 @@ def main():
     print("=" * 100)
     print("加载数据集...")
     print("=" * 100)
-    questions = load_prompts_from_dataset(dataset_path, max_samples=3)
+    questions = load_prompts_from_dataset(dataset_path, max_samples=5)
     print(f"加载了 {len(questions)} 个问题")
     print()
     
@@ -116,7 +116,7 @@ def main():
         )
         
         print("[formatted_prompt]")
-        print(repr(prompt_no_thinking[-200:]))  # 只显示最后200个字符
+        print(repr(prompt_no_thinking))  # 只显示最后200个字符
         print()
         
         # 生成
@@ -163,7 +163,7 @@ def main():
         )
         
         print("[formatted_prompt]")
-        print(repr(prompt_with_thinking[-200:]))  # 只显示最后200个字符
+        print(repr(prompt_with_thinking))  # 只显示最后200个字符
         print()
         
         # 生成

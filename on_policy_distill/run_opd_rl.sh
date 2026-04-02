@@ -3,7 +3,7 @@
 set -euo pipefail
 
 # Usage:
-#   bash on_policy_distill/run_opd_rl.sh 0.6b
+#   bash on_policy_distill/run_opd_rl.sh 0.6b standard_opd
 #   bash on_policy_distill/run_opd_rl.sh 1.7b standard_opd
 #   bash on_policy_distill/run_opd_rl.sh 1.7b dual_kl_equal
 #   bash on_policy_distill/run_opd_rl.sh 1.7b dual_kl_always_on
@@ -45,33 +45,33 @@ cd "${REPO_ROOT}"
 ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-accelerate_config_multi_8gpu.yaml}"
 YAML_CONFIG="${YAML_CONFIG:-on_policy_distill/opd_rl_experiments.yaml}"
 
-STUDENT_ROOT="${STUDENT_ROOT:-/data/oss_bucket_0/zhulin/models}"
+STUDENT_ROOT="${STUDENT_ROOT:-/data/oss_bucket_0/zhulin/output}"
 TEACHER_MODEL="${TEACHER_MODEL:-/data/oss_bucket_0/zhulin/models/Qwen3-8B}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-/data/oss_bucket_0/zhulin/output/opd-rl}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-/data/oss_bucket_0/zhulin/output/test}"
 
 DATASET="${DATASET:-/data/oss_bucket_0/zhulin/datasets/DeepMath-103K}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-4096}"
-SWANLAB_PROJECT="${SWANLAB_PROJECT:-}"
-SWANLAB_NAME="${SWANLAB_NAME:-}"
+SWANLAB_PROJECT="${SWANLAB_PROJECT:-opd}"
 SWANLAB_MODE="${SWANLAB_MODE:-offline}"
 
 case "${MODEL_SIZE}" in
   0.6b)
-    STUDENT_MODEL_DEFAULT="${STUDENT_ROOT}/Qwen3-0.6B-Base"
+    STUDENT_MODEL_DEFAULT="${STUDENT_ROOT}/Qwen3-0.6B-Base-sft-checkpoint-79"
     OUTPUT_NAME_DEFAULT="opd-rl-qwen3-0.6b-${EXPERIMENT}"
-    GEN_MICRO_BATCH_DEFAULT=16
-    LP_MICRO_BATCH_DEFAULT=8
+    GEN_MICRO_BATCH_DEFAULT=32
+    LP_MICRO_BATCH_DEFAULT=2
     ;;
   1.7b)
-    STUDENT_MODEL_DEFAULT="${STUDENT_ROOT}/Qwen3-1.7B-Base"
+    # STUDENT_MODEL_DEFAULT="${STUDENT_ROOT}/Qwen3-1.7B-Base"
+    STUDENT_MODEL_DEFAULT="${STUDENT_ROOT}/Qwen3-1.7B-Base-sft-checkpoint-79"
     OUTPUT_NAME_DEFAULT="opd-rl-qwen3-1.7b-${EXPERIMENT}"
-    GEN_MICRO_BATCH_DEFAULT=8
-    LP_MICRO_BATCH_DEFAULT=4
+    GEN_MICRO_BATCH_DEFAULT=32
+    LP_MICRO_BATCH_DEFAULT=2
     ;;
   4b)
-    STUDENT_MODEL_DEFAULT="${STUDENT_ROOT}/Qwen3-4B-Base"
+    STUDENT_MODEL_DEFAULT="${STUDENT_ROOT}/Qwen3-4B-Base-sft-checkpoint-79"
     OUTPUT_NAME_DEFAULT="opd-rl-qwen3-4b-${EXPERIMENT}"
-    GEN_MICRO_BATCH_DEFAULT=4
+    GEN_MICRO_BATCH_DEFAULT=32
     LP_MICRO_BATCH_DEFAULT=1
     ;;
   *)
@@ -85,6 +85,7 @@ STUDENT_MODEL="${STUDENT_MODEL:-${STUDENT_MODEL_DEFAULT}}"
 OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/${OUTPUT_NAME_DEFAULT}}"
 GEN_MICRO_BATCH="${GEN_MICRO_BATCH:-${GEN_MICRO_BATCH_DEFAULT}}"
 LP_MICRO_BATCH="${LP_MICRO_BATCH:-${LP_MICRO_BATCH_DEFAULT}}"
+SWANLAB_NAME="${SWANLAB_NAME:-${OUTPUT_NAME_DEFAULT}}"
 
 echo "Running OPD-RL"
 echo "  model_size:        ${MODEL_SIZE}"
@@ -96,8 +97,8 @@ echo "  dataset:           ${DATASET}"
 echo "  max_new_tokens:    ${MAX_NEW_TOKENS}"
 echo "  gen_micro_batch:   ${GEN_MICRO_BATCH}"
 echo "  lp_micro_batch:    ${LP_MICRO_BATCH}"
-echo "  swanlab_project:   ${SWANLAB_PROJECT:-<disabled>}"
-echo "  swanlab_name:      ${SWANLAB_NAME:-<auto/null>}"
+echo "  swanlab_project:   ${SWANLAB_PROJECT}"
+echo "  swanlab_name:      ${SWANLAB_NAME}"
 echo "  swanlab_mode:      ${SWANLAB_MODE}"
 echo "  accelerate_config: ${ACCELERATE_CONFIG}"
 echo "  yaml_config:       ${YAML_CONFIG}"

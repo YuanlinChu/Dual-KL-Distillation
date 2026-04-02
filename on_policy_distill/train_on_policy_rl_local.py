@@ -417,6 +417,21 @@ def compute_rollout_logprobs(
 
             del ids_mb, attn_mb, logits_t
 
+    old_logprobs = torch.cat(old_chunks, dim=0) if old_chunks else torch.zeros(seqs_cpu.size(0), max(seqs_cpu.size(1) - 1, 0))
+    teacher_logprobs = torch.cat(teacher_chunks, dim=0) if teacher_chunks else torch.zeros_like(old_logprobs)
+
+    if compute_fkl_samples and sampled_token_chunks:
+        sampled_tokens = torch.cat(sampled_token_chunks, dim=0)
+        sampled_student_logprobs = torch.cat(sampled_student_chunks, dim=0)
+        sampled_teacher_logprobs = torch.cat(sampled_teacher_chunks, dim=0)
+    else:
+        seq_len = max(seqs_cpu.size(1) - 1, 0)
+        sampled_tokens = torch.zeros(seqs_cpu.size(0), seq_len, dtype=torch.long)
+        sampled_student_logprobs = torch.zeros(seqs_cpu.size(0), seq_len)
+        sampled_teacher_logprobs = torch.zeros(seqs_cpu.size(0), seq_len)
+
+    return old_logprobs, teacher_logprobs, sampled_tokens, sampled_student_logprobs, sampled_teacher_logprobs            
+
 
 def build_zero_centered_group_rewards(num_rollouts: int, group_size: int) -> torch.Tensor:
     if group_size <= 1:

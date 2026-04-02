@@ -1,5 +1,6 @@
 tinker-cookbook/
 out/
+outputs/
 wandb/
 swanlab/
 data/DeepMath-32k/
