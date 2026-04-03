@@ -122,7 +122,7 @@ $$
 
 其中：
 
-- $ \lambda_{\text{coef}} $ 对应代码中的 `kl_coef`
+- $$ \lambda_{\text{coef}} $$ 对应代码中的 `kl_coef`
 - 默认建议取 `1`
 
 如果开启未来折扣，则进一步构造：
